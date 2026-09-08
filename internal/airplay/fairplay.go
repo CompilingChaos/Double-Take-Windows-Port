@@ -111,17 +111,15 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 	dbg("[FP] playfairDecrypt fpAesKey: %02x", fpAesKey[:])
 	dbg("[FP] m3 first 32 bytes: %02x", c.fpM3[:min(32, len(c.fpM3))])
 
-	// Hash with pair-verify shared secret (ECDH X25519) if available.
-	// The receiver does: SHA-512(fairplay_decrypt(ekey) || ecdh_secret)[:16]
-	finalKey := c.fpAesKey
-	if c.PairKeys != nil && len(c.PairKeys.SharedSecret) > 0 {
-		h := sha512.New()
-		h.Write(c.fpAesKey)
-		h.Write(c.PairKeys.SharedSecret)
-		finalKey = h.Sum(nil)[:16]
-		dbg("[FP] hashed with SharedSecret (%d bytes)", len(c.PairKeys.SharedSecret))
+	// Pair-verify records whether this receiver expects its shared secret mixed
+	// into the FairPlay key. The legacy Apple TV path deliberately leaves the
+	// raw key unchanged even though raw pair-verify also produces a secret.
+	mixPairVerifyKey := c.PairKeys != nil && c.PairKeys.MixFairPlayKey
+	finalKey := deriveStreamMasterKey(c.fpAesKey, sharedSecret(c.PairKeys), mixPairVerifyKey)
+	if mixPairVerifyKey && len(sharedSecret(c.PairKeys)) > 0 {
+		dbg("[FP] mixed with pair-verify SharedSecret (%d bytes)", len(sharedSecret(c.PairKeys)))
 	} else {
-		dbg("[FP] using raw fpAesKey (no SharedSecret available)")
+		dbg("[FP] using raw fpAesKey (legacy receiver or no SharedSecret)")
 	}
 
 	c.fpKey = finalKey
@@ -132,6 +130,23 @@ func (c *AirPlayClient) FairPlaySetup(ctx context.Context) error {
 	dbg("[FP] stream IV:      %02x", iv[:])
 
 	return nil
+}
+
+func sharedSecret(keys *PairKeys) []byte {
+	if keys == nil {
+		return nil
+	}
+	return keys.SharedSecret
+}
+
+func deriveStreamMasterKey(rawKey, secret []byte, mixPairVerifySecret bool) []byte {
+	if !mixPairVerifySecret || len(secret) == 0 {
+		return rawKey
+	}
+	h := sha512.New()
+	h.Write(rawKey)
+	h.Write(secret)
+	return h.Sum(nil)[:16]
 }
 
 // buildEkey constructs a 72-byte ekey with the FPLY header format.

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -75,6 +76,8 @@ type Config struct {
 	CredBackend string
 	FPS         int
 	Bitrate     int
+	PortMin     int
+	PortMax     int
 	HWAccel     string
 	Debug       bool
 	TestMode    bool
@@ -162,7 +165,7 @@ func New(cfg Config) (*Daemon, error) {
 
 // Run starts the daemon control endpoint and blocks until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context) error {
-	airplay.DebugMode = d.cfg.Debug
+	airplay.SetDebugMode(d.cfg.Debug)
 	network := controlNetwork()
 	if network == "unix" {
 		// Clean up stale socket.
@@ -276,6 +279,11 @@ func (d *Daemon) backgroundDiscover(ctx context.Context) {
 			}
 			d.devices = devices
 			sort.Slice(d.devices, func(i, j int) bool {
+				iTV := strings.Contains(strings.ToLower(d.devices[i].Model), "appletv")
+				jTV := strings.Contains(strings.ToLower(d.devices[j].Model), "appletv")
+				if iTV != jTV {
+					return iTV
+				}
 				return d.devices[i].IP < d.devices[j].IP
 			})
 		} else {
@@ -509,13 +517,19 @@ func (d *Daemon) handleConnect(req Request) Response {
 // pickFreeDeviceLocked returns the first discovered device not already in d.streams.
 // Must be called with d.mu held.
 func (d *Daemon) pickFreeDeviceLocked(preferredPort int) (string, int) {
-	for _, dev := range d.devices {
-		if _, inUse := d.streams[dev.IP]; !inUse {
-			p := dev.Port
-			if preferredPort != 0 {
-				p = preferredPort
+	for _, preferAppleTV := range []bool{true, false} {
+		for _, dev := range d.devices {
+			isAppleTV := strings.Contains(strings.ToLower(dev.Model), "appletv")
+			if isAppleTV != preferAppleTV {
+				continue
 			}
-			return dev.IP, p
+			if _, inUse := d.streams[dev.IP]; !inUse {
+				p := dev.Port
+				if preferredPort != 0 {
+					p = preferredPort
+				}
+				return dev.IP, p
+			}
 		}
 	}
 	return "", 0
@@ -532,8 +546,28 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 		defer d.mu.Unlock()
 		d.removeStreamLocked(target)
 	}
+	requestCredential := func(device string) {
+		d.mu.Lock()
+		delete(d.streams, target)
+		d.pendingTarget = target
+		d.pendingPort = port
+		d.mu.Unlock()
+		log.Printf("[daemon] pairing code or password required for %s - waiting for user input", device)
+	}
 
-	client := airplay.NewAirPlayClient(target, port)
+	newClient := func() *airplay.AirPlayClient {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for _, device := range d.devices {
+			if device.IP == target {
+				device.Port = port
+				return airplay.NewAirPlayClientForDevice(device)
+			}
+		}
+		return airplay.NewAirPlayClient(target, port)
+	}
+	client := newClient()
+	client.SetPassword(pin)
 	if err := client.Connect(ctx); err != nil {
 		removeStream(fmt.Sprintf("connect to %s:%d failed: %v", target, port, err))
 		return
@@ -542,6 +576,10 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	info, err := client.GetInfo()
 	if err != nil {
 		client.Close()
+		if errors.Is(err, airplay.ErrCredentialsRequired) && pin == "" {
+			requestCredential(target)
+			return
+		}
 		removeStream(fmt.Sprintf("get info failed: %v", err))
 		return
 	}
@@ -571,8 +609,9 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 		}
 		paired = true
 		if client.PairKeys != nil {
-			if err := d.credStore.Save(deviceID, client.PairingID,
-				client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private); err != nil {
+			if err := d.credStore.SavePairing(deviceID, client.PairingID,
+				client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
+				client.PairingProtocol()); err != nil {
 				log.Printf("[daemon] warning: failed to save credentials: %v", err)
 			} else {
 				log.Printf("[daemon] credentials saved for %s (deviceID: %s)", info.Name, deviceID)
@@ -581,16 +620,15 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	}
 
 	if !paired && savedCreds != nil && savedCreds.HasPairingCredentials() {
-		pub, priv := savedCreds.Ed25519Keys()
-		client.PairingID = savedCreds.PairingID
-		client.PairKeys = &airplay.PairKeys{
-			Ed25519Public:  pub,
-			Ed25519Private: priv,
+		verifyErr := client.RestorePairingCredentials(savedCreds)
+		if verifyErr == nil {
+			verifyErr = client.PairVerify(ctx)
 		}
-		if err := client.PairVerify(ctx); err != nil {
-			log.Printf("[daemon] pair-verify with saved creds failed: %v, trying transient pairing", err)
+		if verifyErr != nil {
+			log.Printf("[daemon] pair-verify with saved creds failed: %v, trying transient pairing", verifyErr)
 			client.Close()
-			client = airplay.NewAirPlayClient(target, port)
+			client = newClient()
+			client.SetPassword(pin)
 			if err := client.Connect(ctx); err != nil {
 				removeStream(fmt.Sprintf("reconnect failed: %v", err))
 				return
@@ -626,13 +664,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 				}
 			}
 			client.Close()
-			d.mu.Lock()
-			// Remove the connecting placeholder and record the pending PIN state.
-			delete(d.streams, target)
-			d.pendingTarget = target
-			d.pendingPort = port
-			d.mu.Unlock()
-			log.Printf("[daemon] PIN required for %s — waiting for user input", info.Name)
+			requestCredential(info.Name)
 			return
 		}
 		paired = true
@@ -653,19 +685,29 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	streamCfg := airplay.StreamConfig{
 		FPS:       d.cfg.FPS,
 		Bitrate:   d.cfg.Bitrate,
+		PortMin:   d.cfg.PortMin,
+		PortMax:   d.cfg.PortMax,
 		NoEncrypt: d.cfg.NoEncrypt,
 		DirectKey: d.cfg.DirectKey,
 		NoAudio:   d.cfg.NoAudio,
 	}
-	session, err := client.SetupMirror(ctx, streamCfg)
+	var captureWidth, captureHeight int
+	session, err := client.SetupMirrorWithVideoPreparation(ctx, streamCfg, func(width, height int) error {
+		captureWidth, captureHeight = width, height
+		return nil
+	})
 	if err != nil {
 		client.Close()
+		if errors.Is(err, airplay.ErrCredentialsRequired) && pin == "" {
+			requestCredential(info.Name)
+			return
+		}
 		removeStream(fmt.Sprintf("mirror setup failed: %v", err))
 		return
 	}
 
 	// Obtain or reuse the shared screen capture + broadcast fan-out.
-	sink, err := d.getOrStartBroadcastLocked(screenCastRestoreToken, deviceID)
+	sink, err := d.getOrStartBroadcastLocked(screenCastRestoreToken, deviceID, captureWidth, captureHeight)
 	if err != nil {
 		session.Close()
 		client.Close()
@@ -697,7 +739,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 
 	// Start audio for this stream independently.
 	if !d.cfg.NoAudio && session.HasAudio() {
-		audioCapture, audioErr := airplay.StartAudioCapture(ctx, d.cfg.TestMode)
+		audioCapture, audioErr := airplay.StartAudioCapture(ctx, d.cfg.TestMode, session.AudioCodec())
 		if audioErr != nil {
 			log.Printf("[daemon] audio capture failed: %v (continuing without audio)", audioErr)
 		} else {
@@ -731,7 +773,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 // getOrStartBroadcastLocked ensures a shared BroadcastCapture is running and
 // returns a new sink registered with it. If no capture is running, it starts one.
 // Must NOT be called with d.mu held.
-func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airplay.BroadcastSink, error) {
+func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxWidth, maxHeight int) (*airplay.BroadcastSink, error) {
 	d.mu.Lock()
 	bc := d.broadcast
 	d.mu.Unlock()
@@ -747,6 +789,8 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string) (*airp
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
+		MaxWidth:     maxWidth,
+		MaxHeight:    maxHeight,
 		RestoreToken: restoreToken,
 	}
 	if deviceID != "" {

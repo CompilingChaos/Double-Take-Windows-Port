@@ -1,0 +1,18 @@
+//go:build linux
+
+package airplay
+
+import (
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+// bootRelativeNow returns the system monotonic boot clock, including suspend.
+func bootRelativeNow() time.Duration {
+	var timestamp unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &timestamp); err == nil {
+		return time.Duration(timestamp.Sec)*time.Second + time.Duration(timestamp.Nsec)
+	}
+	return time.Since(appStartTime)
+}

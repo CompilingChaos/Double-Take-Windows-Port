@@ -20,9 +20,11 @@ import (
 
 // CaptureConfig holds screen capture settings.
 type CaptureConfig struct {
-	FPS     int
-	Bitrate int    // Video bitrate in kbps (0 = auto)
-	HWAccel string // "auto", "vaapi", "none"
+	FPS       int
+	Bitrate   int    // Video bitrate in kbps (0 = auto)
+	HWAccel   string // "auto", "vaapi", "none"
+	MaxWidth  int    // receiver-advertised encoded canvas; zero keeps native size
+	MaxHeight int
 
 	RestoreToken     string
 	SaveRestoreToken func(string) error

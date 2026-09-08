@@ -1,17 +1,21 @@
 package airplay
 
 import (
+	"bytes"
 	"context"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
 	"net"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,33 +26,180 @@ import (
 	"howett.net/plist"
 )
 
+const (
+	timingProtocolNTP          = "NTP"
+	timingProtocolPTP          = "PTP"
+	sessionInfoFallbackTimeout = 3 * time.Second
+
+	legacyAirPlaySourceVersion = "280.33"
+	modernAirPlaySourceVersion = "980.71.1"
+)
+
+// mediaClock maps local monotonic time onto the receiver's PTP timeline. The
+// receiver's X-Apple-RequestReceivedTimestamp is in the same boot-relative
+// domain as its PTP Follow_Up timestamps, so no local PTP stack is required.
+type mediaClock struct {
+	mu              sync.RWMutex
+	anchorLocal     time.Time
+	anchorTimestamp uint64
+	timelineID      uint64
+}
+
+func (c *mediaClock) configureFromSetup(response map[string]interface{}, headers map[string]string, receivedAt time.Time) error {
+	peer, _ := response["timingPeerInfo"].(map[string]interface{})
+	timelineID := plistUint64(peer["ClockID"])
+	if timelineID == 0 {
+		return fmt.Errorf("SETUP response omitted timingPeerInfo.ClockID")
+	}
+
+	anchorTimestamp, receivedMillis, processingMillis, err := receiverClockTimestamp(headers)
+	if err != nil {
+		// Keep the receiver's identity even when the private clock-anchor headers
+		// are absent. The fallback can then anchor local boot time to the actual
+		// advertised PTP timeline.
+		c.mu.Lock()
+		c.timelineID = timelineID
+		c.mu.Unlock()
+		return err
+	}
+
+	c.mu.Lock()
+	c.timelineID = timelineID
+	c.anchorLocal = receivedAt
+	c.anchorTimestamp = anchorTimestamp
+	c.mu.Unlock()
+	dbg("[PTP] receiver clock: timeline=0x%016x anchor=%dms processing=%dms",
+		timelineID, receivedMillis, processingMillis)
+	return nil
+}
+
+// configureFromLocalClock anchors a PTP timeline to the sender's boot clock.
+// Some third-party PTP receivers return ClockID but omit Apple's private clock
+// headers. A ClockID remains mandatory: inventing one would describe a timeline
+// the receiver has never advertised and would make both audio and video invalid.
+func (c *mediaClock) configureFromLocalClock() error {
+	anchorLocal := time.Now()
+	anchorTimestamp := compactTimestamp(bootRelativeNow())
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.timelineID == 0 {
+		return fmt.Errorf("cannot configure local PTP clock without receiver ClockID")
+	}
+	c.anchorLocal = anchorLocal
+	c.anchorTimestamp = anchorTimestamp
+	return nil
+}
+
+func (c *mediaClock) identity() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.timelineID
+}
+
+func receiverClockTimestamp(headers map[string]string) (timestamp, receivedMillis, processingMillis uint64, err error) {
+	receivedMillis, err = strconv.ParseUint(headers["x-apple-requestreceivedtimestamp"], 10, 64)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid X-Apple-RequestReceivedTimestamp %q", headers["x-apple-requestreceivedtimestamp"])
+	}
+	processingMillis, err = strconv.ParseUint(headers["x-apple-processingtime"], 10, 64)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid X-Apple-ProcessingTime %q", headers["x-apple-processingtime"])
+	}
+	maxMillis := uint64(math.MaxInt64 / int64(time.Millisecond))
+	if receivedMillis > maxMillis || processingMillis > maxMillis-receivedMillis {
+		return 0, 0, 0, fmt.Errorf("receiver timestamp is out of range")
+	}
+	return compactTimestamp(time.Duration(receivedMillis+processingMillis) * time.Millisecond), receivedMillis, processingMillis, nil
+}
+
+func (c *mediaClock) reanchor(headers map[string]string, receivedAt time.Time) error {
+	anchorTimestamp, _, _, err := receiverClockTimestamp(headers)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	// A feedback response carries the receiver's earlier request/processing
+	// timestamp but is observed only when the response reaches us. Network delay
+	// can therefore make a fresh sample appear older than the mapping already in
+	// use. Never move the shared clock backwards: audio and video must observe the
+	// same continuous timeline instead of relying on video-only packet clamping.
+	if !c.anchorLocal.IsZero() && !receivedAt.Before(c.anchorLocal) {
+		projected := c.anchorTimestamp + compactTimestamp(receivedAt.Sub(c.anchorLocal))
+		if anchorTimestamp < projected {
+			anchorTimestamp = projected
+		}
+	}
+	c.anchorTimestamp = anchorTimestamp
+	c.anchorLocal = receivedAt
+	c.mu.Unlock()
+	return nil
+}
+
+// updateTimingPeerInfo switches to a newly advertised PTP timeline without
+// introducing a timestamp discontinuity. Event-channel timing updates contain
+// only peer metadata (not a receiver timestamp), so carry the current estimate
+// forward to the instant the command was received and update both atomically.
+func (c *mediaClock) updateTimingPeerInfo(peer map[string]interface{}, receivedAt time.Time) error {
+	timelineID := plistUint64(peer["ClockID"])
+	if timelineID == 0 {
+		return fmt.Errorf("updateTimingPeerInfo omitted ClockID")
+	}
+
+	c.mu.Lock()
+	previousTimeline := c.timelineID
+	if !c.anchorLocal.IsZero() && !receivedAt.Before(c.anchorLocal) {
+		c.anchorTimestamp += compactTimestamp(receivedAt.Sub(c.anchorLocal))
+		c.anchorLocal = receivedAt
+	}
+	c.timelineID = timelineID
+	c.mu.Unlock()
+
+	dbg("[PTP] event timing peer update: timeline=0x%016x (was 0x%016x)", timelineID, previousTimeline)
+	return nil
+}
+
+func (c *mediaClock) now(bias time.Duration) (timestamp, timelineID uint64, ok bool) {
+	c.mu.RLock()
+	anchorLocal := c.anchorLocal
+	anchorTimestamp := c.anchorTimestamp
+	timelineID = c.timelineID
+	c.mu.RUnlock()
+	if anchorLocal.IsZero() || timelineID == 0 {
+		return 0, 0, false
+	}
+	return anchorTimestamp + compactTimestamp(time.Since(anchorLocal)+bias), timelineID, true
+}
+
 // MirrorSession manages an active screen mirroring session.
 type MirrorSession struct {
-	client        *AirPlayClient
-	dataConn      net.Conn
-	dataMu        sync.Mutex // protects writes to dataConn
-	eventConn     net.Conn
-	timingConn    net.PacketConn
-	eventListener net.Listener
-	DataPort      int
-	videoWidth    int
-	videoHeight   int
-	displayWidth  int    // receiver presentation width (codec header offset 56)
-	displayHeight int    // receiver presentation height (codec header offset 60)
-	sessionURI    string // RTSP session URI for TEARDOWN
+	client      *AirPlayClient
+	dataConn    net.Conn
+	dataMu      sync.Mutex // protects writes to dataConn
+	eventConn   net.Conn
+	timingConn  net.PacketConn
+	cancel      context.CancelFunc
+	closeOnce   sync.Once
+	workers     sync.WaitGroup
+	closeErr    error
+	DataPort    int
+	videoWidth  int
+	videoHeight int
+	sessionURI  string // RTSP session URI for TEARDOWN
 
-	streamCipher   func([]byte) []byte // AES-CTR encryption
-	chachaCipher   cipher.AEAD         // ChaCha20-Poly1305 AEAD (nil = use AES-CTR)
-	chachaNonce    uint64              // per-frame nonce counter
-	frameSeq       uint32
-	firstFrameSent chan struct{} // closed after first video frame is sent
-	timestampBias  time.Duration
+	streamCipher       func([]byte) []byte // AES-CTR encryption
+	chachaCipher       cipher.AEAD         // ChaCha20-Poly1305 AEAD (nil = use AES-CTR)
+	chachaNonce        uint64              // per-frame nonce counter
+	frameSeq           uint32
+	lastFrameTimestamp uint64
+	firstFrameSent     chan struct{} // closed after first video frame is sent
+	timestampBias      time.Duration
+	timingProtocol     string
+	mediaClock         *mediaClock
 
 	// Audio
 	audioStream *AudioStream
 	noAudio     bool
-	closeOnce   sync.Once
-	closeErr    error
 }
 
 func selectAudioSecurityMode(encrypted bool) audioSecurityMode {
@@ -58,10 +209,163 @@ func selectAudioSecurityMode(encrypted bool) audioSecurityMode {
 	return audioSecurityLegacyAES
 }
 
+type mirrorSetupRequest struct {
+	deviceID          string
+	sessionUUID       string
+	sourceVersion     string
+	timingProtocol    string
+	timingPort        int
+	timingPeerID      string
+	timingPeerAddress string
+	name              string
+}
+
+func (r mirrorSetupRequest) sessionPlist() map[string]interface{} {
+	request := map[string]interface{}{
+		"deviceID":                 r.deviceID,
+		"macAddress":               r.deviceID,
+		"sessionUUID":              r.sessionUUID,
+		"sourceVersion":            r.sourceVersion,
+		"isScreenMirroringSession": true,
+		"timingProtocol":           r.timingProtocol,
+		"osBuildVersion":           "13F69",
+		"model":                    senderPlatformName(),
+		"name":                     r.name,
+	}
+	if r.timingProtocol == timingProtocolNTP {
+		request["timingPort"] = int64(r.timingPort)
+	} else if r.timingProtocol == timingProtocolPTP {
+		peer := map[string]interface{}{
+			"ID":                                r.timingPeerID,
+			"SupportsClockPortMatchingOverride": true,
+			"DeviceType":                        int64(0),
+			"Addresses":                         []interface{}{r.timingPeerAddress},
+		}
+		request["timingPeerInfo"] = peer
+		request["timingPeerList"] = []interface{}{peer}
+	}
+	return request
+}
+
+func (r mirrorSetupRequest) controlPlist() map[string]interface{} {
+	request := r.sessionPlist()
+	request["updateSessionRequest"] = false
+	// Apple's sender combines GET /info with the control SETUP because display
+	// metadata may not exist until this request creates the media session. The
+	// receiver returns that ordinary info dictionary under the SETUP response's
+	// "info" key before any media stream is configured. A qualifier is used only
+	// for Apple's separate protected-display-capabilities exchange.
+	request["combinedGetInfoWithControlSetup"] = true
+	return request
+}
+
+func (r mirrorSetupRequest) legacyStreamPlist(stream map[string]interface{}) map[string]interface{} {
+	request := r.sessionPlist()
+	request["streams"] = []interface{}{stream}
+	return request
+}
+
+func streamOnlyPlist(stream map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"streams": []interface{}{stream},
+	}
+}
+
+func clonePlistMap(source map[string]interface{}) map[string]interface{} {
+	clone := make(map[string]interface{}, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
+}
+
+func setupShapeRejected(err error) bool {
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.StatusCode {
+	case 400, 406, 415, 455, 500, 501:
+		return true
+	default:
+		return false
+	}
+}
+
+// setupOrderRejected is deliberately narrower than descriptor negotiation.
+// These protocol statuses are the bounded evidence used for one transition to
+// media-first ordering. A generic server failure, authentication challenge, or
+// transport error is not evidence that changing the ordering is valid.
+func setupOrderRejected(err error) bool {
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.StatusCode {
+	case 400, 405, 406, 415, 455, 501:
+		return true
+	default:
+		return false
+	}
+}
+
+func audioLayoutName(layout audioConnectionLayout) string {
+	if layout == audioLayoutStreamConnections {
+		return "streamConnections"
+	}
+	return "controlPort"
+}
+
+func (c *AirPlayClient) requestSetup(uri, phase string, request map[string]interface{}) (map[string]interface{}, map[string]string, time.Time, error) {
+	body, err := plist.Marshal(request, plist.BinaryFormat)
+	if err != nil {
+		return nil, nil, time.Time{}, fmt.Errorf("marshal %s SETUP: %w", phase, err)
+	}
+	responseBody, headers, err := c.rtspRequest("SETUP", uri, "application/x-apple-binary-plist", body, nil)
+	receivedAt := time.Now()
+	if err != nil {
+		return nil, nil, receivedAt, fmt.Errorf("%s SETUP: %w", phase, err)
+	}
+	var response map[string]interface{}
+	if _, err := plist.Unmarshal(responseBody, &response); err != nil {
+		return nil, nil, receivedAt, fmt.Errorf("unmarshal %s SETUP response: %w", phase, err)
+	}
+	dbg("[SETUP] %s response: %+v", phase, response)
+	return response, headers, receivedAt, nil
+}
+
 // setupMirrorSession negotiates the mirroring stream with the Apple TV.
-func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig) (*MirrorSession, error) {
+func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig, prepareVideoCapture func(width, height int) error) (*MirrorSession, error) {
 	sessionUUID := generateUUID()
 	clientDeviceID := uuidToMAC(c.sessionID)
+	senderName := pairingClientName()
+	policy, err := compatibilityForReceiver(c.info, c.encrypted, !cfg.NoAudio)
+	if err != nil {
+		return nil, fmt.Errorf("negotiate screen audio: %w", err)
+	}
+	sourceVersion := policy.sourceVersion()
+	timingProtocol := policy.timing
+	var clock *mediaClock
+	if timingProtocol == timingProtocolPTP {
+		clock = &mediaClock{}
+	}
+	setupRequest := mirrorSetupRequest{
+		deviceID:       clientDeviceID,
+		sessionUUID:    sessionUUID,
+		sourceVersion:  sourceVersion,
+		timingProtocol: timingProtocol,
+		name:           senderName,
+	}
+	if timingProtocol == timingProtocolPTP {
+		localAddress, err := localIPForConnection(c.conn)
+		if err != nil {
+			return nil, fmt.Errorf("determine PTP peer address: %w", err)
+		}
+		setupRequest.timingPeerID = generateUUID()
+		setupRequest.timingPeerAddress = localAddress
+		dbg("[PTP] local timing peer: id=%s address=%s", setupRequest.timingPeerID, localAddress)
+	}
+	dbg("[SETUP] timing protocol: %s (sourceVersion=%s)", timingProtocol, sourceVersion)
 
 	// Determine stream encryption key
 	encKey := c.fpKey
@@ -84,9 +388,9 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		dbg("[SETUP] using encryption (key: %d bytes, IV: %d bytes)", len(encKey), len(encIV))
 	}
 
-	// Allocate 3 consecutive UDP ports for audio: timing(N), control(N+1), data(N+2).
-	// Real Apple senders (AirMyPC, etc.) use consecutive ports; the Apple TV
-	// classifies incoming audio by source port and expects this pattern.
+	// Allocate separate consecutive sockets for timing, RTCP, and RTP. Only the
+	// RTCP port is advertised; the receiver accepts RTP from the data socket's
+	// independently allocated source port.
 	audioPorts, err := allocateConsecutiveUDPPortsInRange(3, cfg.PortMin, cfg.PortMax)
 	if err != nil {
 		return nil, fmt.Errorf("allocate audio ports: %w", err)
@@ -94,83 +398,65 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	timingConn := audioPorts[0]
 	audioCtrlConn := audioPorts[1]
 	audioDataConn := audioPorts[2]
-	timingPort := timingConn.LocalAddr().(*net.UDPAddr).Port
-	dbg("[SETUP] consecutive UDP ports: timing=%d ctrl=%d data=%d", timingPort, timingPort+1, timingPort+2)
-
-	// Start NTP timing responder BEFORE sending SETUP so it's ready
-	// when the Apple TV probes us
-	go ntpTimingResponder(ctx, timingConn)
-
-	// Start a TCP listener for the event (reverse) channel
-	eventListener, err := listenTCPInRange(cfg.PortMin, cfg.PortMax, timingPort)
-	if err != nil {
-		timingConn.Close()
-		return nil, fmt.Errorf("listen event port: %w", err)
-	}
-	eventPort := eventListener.Addr().(*net.TCPAddr).Port
-	dbg("[SETUP] event listener on TCP port %d", eventPort)
-
-	// Accept event connection asynchronously
-	go func() {
-		conn, err := eventListener.Accept()
-		if err != nil {
-			if !strings.Contains(err.Error(), "use of closed network connection") {
-				dbg("[EVENT] accept error: %v", err)
-			}
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	var receiverEventConn, dataConn net.Conn
+	setupSucceeded := false
+	defer func() {
+		if setupSucceeded {
 			return
 		}
-		dbg("[EVENT] Apple TV connected for reverse events from %s", conn.RemoteAddr())
-		// Keep connection open; log received data
-		go func() {
-			buf := make([]byte, 4096)
-			for {
-				n, err := conn.Read(buf)
-				if err != nil {
-					dbg("[EVENT] event channel closed: %v", err)
-					return
-				}
-				dbg("[EVENT] received %d bytes: %02x", n, buf[:min(n, 64)])
-			}
-		}()
+		cancelSession()
+		if dataConn != nil {
+			dataConn.Close()
+		}
+		if receiverEventConn != nil {
+			receiverEventConn.Close()
+		}
+		for _, conn := range audioPorts {
+			conn.Close()
+		}
 	}()
+	timingPort := timingConn.LocalAddr().(*net.UDPAddr).Port
+	setupRequest.timingPort = timingPort
+	dbg("[SETUP] consecutive UDP ports: base=%d ctrl=%d data=%d", timingPort, timingPort+1, timingPort+2)
 
-	sessionLatency := TargetLatency()
-	// Audio and video share this latency so they stay in sync, and it doubles as
-	// the receiver's playout buffer lead. Receivers without a robust jitter buffer
-	// (non-FairPlay-SAP, e.g. Roku) need a conservative floor or they drop audio;
-	// modern Apple receivers can run at the low target latency unchanged.
-	if floor := c.info.playoutLatencyFloor(); sessionLatency < floor {
-		dbg("[SETUP] raising session latency to receiver playout floor: %v", floor)
-		sessionLatency = floor
+	// NTP sessions establish their mapping by probing this port during SETUP.
+	// PTP sessions instead use the receiver's advertised network clock.
+	if timingProtocol == timingProtocolNTP {
+		go ntpTimingResponder(sessionCtx, timingConn)
 	}
 
-	// ---- Working SETUP sequence ----
-	// The receiver expects the audio session to be created first, then the video
-	// stream to be attached to that session, and only then does it accept RECORD.
-	// The practical ordering for current Apple receivers is:
-	//   1. SETUP audio (type=96) with full session context + timingPort
-	//   2. SETUP video (type=110) with a different streamConnectionID
-	//   3. RECORD on the audio URI
-	//   4. SET_PARAMETER volume (twice)
+	sessionLatency := TargetLatency()
+	// Audio and video share this latency so they stay in sync. The NTP path needs
+	// enough packet lead to absorb request/response and userspace scheduling
+	// jitter; PTP retains the explicitly configured low-latency target.
+	if timingProtocol == timingProtocolNTP && sessionLatency < ntpPlayoutLatencyFloor {
+		dbg("[SETUP] raising NTP session latency to %v", ntpPlayoutLatencyFloor)
+		sessionLatency = ntpPlayoutLatencyFloor
+	}
+
+	// Apple's sender prepares the receiver with a control-only SETUP before it
+	// creates media streams. Older protocol implementations can explicitly
+	// reject that control shape; in that case, make exactly one transition to
+	// the legacy media-first sequence. No receiver identity or unrelated feature
+	// bit is used to infer SETUP ordering.
+	sessionFirstSetup := true
 
 	audioStreamConnectionID := int64(time.Now().UnixNano() & 0x7FFFFFFFFFFFFFFF)
-	selectedAudioCodec := AudioCodecALAC
+	selectedAudioCodec := policy.audioCodec
 	// Real Apple senders use streamConnectionID as the RTSP URI path.
-	// Audio SETUP, RECORD, and SET_PARAMETER all use the audio URI.
-	// Video SETUP uses a separate URI with its own streamConnectionID.
+	// Control, audio, RECORD, and SET_PARAMETER share the audio URI; video uses
+	// a separate URI with its own streamConnectionID.
 	audioURI := fmt.Sprintf("rtsp://%s:%d/%d", c.host, c.port, audioStreamConnectionID)
-	controlURI := audioURI
-	audioMode := selectAudioSecurityMode(c.encrypted)
+	audioMode := policy.audioSecurity
 	var audioKey, audioIV, audioChaChaKey []byte
 	if audioMode == audioSecurityChaCha {
 		var err error
 		audioChaChaKey, err = generateAudioChaChaKey(rand.Reader)
 		if err != nil {
-			dbg("[SETUP] audio encryption: chacha key generation failed: %v; falling back to AES-CBC", err)
-			audioMode = audioSecurityLegacyAES
-		} else {
-			dbg("[SETUP] audio encryption: ChaCha20-Poly1305 direct stream key (streamConnectionID=%d, shk=%d bytes)", audioStreamConnectionID, len(audioChaChaKey))
+			return nil, fmt.Errorf("generate ChaCha20-Poly1305 audio key: %w", err)
 		}
+		dbg("[SETUP] audio encryption: ChaCha20-Poly1305 direct stream key (streamConnectionID=%d, shk=%d bytes)", audioStreamConnectionID, len(audioChaChaKey))
 	}
 	if audioMode == audioSecurityLegacyAES && c.fpKey != nil && c.fpIV != nil {
 		audioKey = c.fpKey
@@ -180,142 +466,309 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		dbg("[SETUP] audio encryption: disabled (no FairPlay key available)")
 	}
 
-	// ---- Phase 1: SETUP audio stream (creates session) ----
 	audioDataPort := 0
 	audioControlPort := 0
 	var receiverEventPort int
-	var receiverEventConn net.Conn
-
+	var attemptedEventPort int
 	audioControlLPort := audioCtrlConn.LocalAddr().(*net.UDPAddr).Port
-
-	audioCT, audioSPF, audioFmt, latMin, latMax, _ := selectedAudioCodec.Info()
 	audioLatencySamples := samplesFor44k1(sessionLatency)
-	latMin = int64(audioLatencySamples)
-	latMax = int64(audioLatencySamples)
-	audioFormatIndex := selectedAudioCodec.AudioFormatIndex()
-	audioRedundant := int64(0)
-	if useAudioFEC(audioMode == audioSecurityChaCha) {
-		audioRedundant = 2
-	}
-	disableRetransmits := audioRedundant == 0
+	skipRecord := false
 
-	audioStreamDesc := map[string]interface{}{
+	firstSetup := true
+	sendSetup := func(uri, phase string, request map[string]interface{}) (map[string]interface{}, map[string]string, time.Time, error) {
+		if !firstSetup {
+			return c.requestSetup(uri, phase, request)
+		}
+		firstSetup = false
+		setupHintDone := make(chan struct{})
+		go func() {
+			select {
+			case <-setupHintDone:
+			case <-time.After(3 * time.Second):
+				log.Printf("warning: Apple TV at %s has not responded to SETUP after 3s.", c.host)
+				if timingProtocol == timingProtocolNTP {
+					log.Printf("  this usually means a host firewall is blocking the receiver's NTP probe.")
+					log.Printf("  re-run with -port-range MIN-MAX (e.g. -port-range 60000-60010) and allow")
+					log.Printf("  that UDP range inbound from %s. See the Firewall section of the README.", c.host)
+				}
+			}
+		}()
+		defer close(setupHintDone)
+		return c.requestSetup(uri, phase, request)
+	}
+
+	recordSession := func() error {
+		recordHeaders := map[string]string{
+			"Session":  sessionUUID,
+			"Range":    "npt=0-",
+			"RTP-Info": "seq=0;rtptime=0",
+		}
+		_, responseHeaders, err := c.rtspRequest("RECORD", audioURI, "", nil, recordHeaders)
+		if err != nil {
+			return fmt.Errorf("RECORD: %w", err)
+		}
+		if value, ok := responseHeaders["audio-latency"]; ok {
+			parsed, parseErr := strconv.ParseUint(value, 10, 32)
+			if parseErr != nil {
+				dbg("[SETUP] invalid Audio-Latency header %q: %v", value, parseErr)
+			} else if parsed > 0 {
+				audioLatencySamples = uint32(parsed)
+				sessionLatency = time.Duration(audioLatencySamples) * time.Second / 44100
+				dbg("[SETUP] receiver audio latency: %d samples (%v); using for audio+video", audioLatencySamples, sessionLatency)
+			}
+		}
+		return nil
+	}
+
+	connectEvent := func() error {
+		if receiverEventConn != nil {
+			return nil
+		}
+		if receiverEventPort == 0 {
+			return nil
+		}
+		if attemptedEventPort == receiverEventPort {
+			return nil
+		}
+		attemptedEventPort = receiverEventPort
+		var err error
+		receiverEventConn, err = c.connectEventChannel(sessionCtx, receiverEventPort, clock)
+		if err != nil {
+			return fmt.Errorf("connect receiver event channel: %w", err)
+		}
+		return nil
+	}
+	observeEventPort := func(response map[string]interface{}) {
+		if port := plistInt(response["eventPort"]); port > 0 {
+			receiverEventPort = port
+		}
+	}
+	timingProbesStarted := false
+	startReceiverTimingProbes := func(response map[string]interface{}) {
+		if timingProbesStarted || timingProtocol != timingProtocolNTP {
+			return
+		}
+		receiverTimingPort := plistInt(response["timingPort"])
+		if receiverTimingPort <= 0 {
+			return
+		}
+		timingProbesStarted = true
+		go sendNTPTimingProbes(sessionCtx, timingConn, c.host, receiverTimingPort)
+	}
+	configurePTPClock := func(response map[string]interface{}, headers map[string]string, receivedAt time.Time) error {
+		if timingProtocol != timingProtocolPTP {
+			return nil
+		}
+		if err := clock.configureFromSetup(response, headers, receivedAt); err != nil {
+			if policy.permitsLocalPTPClock() {
+				if fallbackErr := clock.configureFromLocalClock(); fallbackErr == nil {
+					dbg("[PTP] %v; using local boot time on receiver timeline 0x%016x", err, clock.identity())
+					return nil
+				}
+			}
+			return fmt.Errorf("configure PTP media clock: %w", err)
+		}
+		return nil
+	}
+
+	dbg("[SETUP] phase 1 (control): preparing media session")
+	controlPlist := setupRequest.controlPlist()
+	if policy.fairPlayOnControl() {
+		addFairPlayRootFields(controlPlist, c.FpEkey, c.fpIV, true)
+	}
+	controlResp, controlHeaders, receivedAt, err := sendSetup(audioURI, "control", controlPlist)
+	videoPrepared := false
+	prepareVideo := func(info *ReceiverInfo) error {
+		if videoPrepared {
+			return nil
+		}
+		videoPrepared = true
+		canvasW, canvasH := info.MirrorSize()
+		maxW, maxH := info.MaxVideoSize()
+		dbg("[SETUP] receiver video canvas: %dx%d (maximum %dx%d)", canvasW, canvasH, maxW, maxH)
+		if prepareVideoCapture == nil {
+			return nil
+		}
+		if err := prepareVideoCapture(canvasW, canvasH); err != nil {
+			return fmt.Errorf("prepare %dx%d video capture: %w", canvasW, canvasH, err)
+		}
+		return nil
+	}
+	refreshSessionInfo := func(phase string) (*ReceiverInfo, error) {
+		refreshed, refreshErr := c.getInfoWithTimeout(sessionInfoFallbackTimeout)
+		if refreshErr == nil {
+			return refreshed, nil
+		}
+		// A complete HTTP error response has been consumed, so the connection is
+		// still synchronized and the provisional snapshot remains usable. A Digest
+		// challenge here is too late for the ordinary whole-SETUP retry: the receiver
+		// has already accepted control or audio SETUP and may own media-session state.
+		// Report it as a non-retryable setup error so the next connection can begin
+		// with the credential configured. Any transport/read failure is also fatal:
+		// continuing after a timed-out sequential request would let its late response
+		// be mistaken for the following SETUP response.
+		if errors.Is(refreshErr, ErrCredentialsRequired) {
+			return nil, fmt.Errorf("%s GET /info requested credentials after session creation; reconnect with the receiver code/password configured before SETUP (%v)", phase, refreshErr)
+		}
+		var statusErr *HTTPStatusError
+		if errors.As(refreshErr, &statusErr) {
+			dbg("[SETUP] %s GET /info fallback was declined: %v", phase, refreshErr)
+			return c.info, nil
+		}
+		return nil, fmt.Errorf("%s GET /info fallback: %w", phase, refreshErr)
+	}
+	if err != nil {
+		if !setupOrderRejected(err) {
+			return nil, err
+		}
+		sessionFirstSetup = false
+		dbg("[SETUP] receiver rejected control-first SETUP; negotiating legacy media-first SETUP")
+	} else {
+		resolvedInfo := c.info
+		sessionDisplayResolved := false
+		if update, ok := controlResp["info"].(map[string]interface{}); ok {
+			updatedInfo, updateErr := c.applyReceiverInfoUpdate(update, controlHeaders["server"])
+			if updateErr != nil {
+				dbg("[SETUP] invalid combined receiver info: %v", updateErr)
+			} else {
+				resolvedInfo = updatedInfo
+				_, displaysPresent := update["displays"]
+				displayW, displayH := updatedInfo.DisplaySize()
+				sessionDisplayResolved = displaysPresent && displayW > 0 && displayH > 0
+			}
+		}
+		// Combined GetInfo is optional, and older implementations may accept its
+		// keys without returning an info dictionary. Once control SETUP has created
+		// the media session, a normal encrypted GET /info observes the same dynamic
+		// display state. Refresh whenever the accepted combined response did not
+		// explicitly supply a usable display; a nonzero pre-session display can be
+		// provisional too.
+		if prepareVideoCapture != nil && !sessionDisplayResolved {
+			refreshed, refreshErr := refreshSessionInfo("post-control")
+			if refreshErr != nil {
+				return nil, refreshErr
+			}
+			resolvedInfo = refreshed
+		}
+		if err := prepareVideo(resolvedInfo); err != nil {
+			return nil, err
+		}
+		startReceiverTimingProbes(controlResp)
+		skipRecord, _ = controlResp["skipRecord"].(bool)
+		if err := configurePTPClock(controlResp, controlHeaders, receivedAt); err != nil {
+			return nil, err
+		}
+		observeEventPort(controlResp)
+		if err := connectEvent(); err != nil {
+			return nil, err
+		}
+		if skipRecord {
+			dbg("[SETUP] receiver returned skipRecord=true; session was started by control SETUP")
+		} else if err := recordSession(); err != nil {
+			return nil, err
+		}
+	}
+	// Create the audio stream after the control-first probe, or make it the first
+	// accepted request after a legacy-order rejection.
+	audioCT, audioSPF, audioFmt, latMin, latMax, _ := selectedAudioCodec.Info()
+	// Screen audio has no sender-side minimum latency. The maximum is the
+	// playout lead carried by TimeAnnounce; using that lead as the minimum too
+	// makes the receiver add it again when calculating its render offset.
+	latMin = 0
+	latMax = int64(audioLatencySamples)
+	audioStreamBase := map[string]interface{}{
 		"type":               int64(96),
 		"streamConnectionID": audioStreamConnectionID,
 		"ct":                 audioCT,
 		"spf":                audioSPF,
 		"sr":                 int64(44100),
 		"audioFormat":        audioFmt,
-		"audioFormatIndex":   audioFormatIndex,
-		"controlPort":        int64(audioControlLPort),
 		"audioMode":          "default",
 		"usingScreen":        true,
 		"latencyMin":         latMin,
 		"latencyMax":         latMax,
-		"redundantAudio":     audioRedundant,
 	}
-	if disableRetransmits {
-		audioStreamDesc["disableRetransmits"] = true
-	}
-
-	audioSetupPlist := map[string]interface{}{
-		"deviceID":       clientDeviceID,
-		"macAddress":     clientDeviceID,
-		"sessionUUID":    sessionUUID,
-		"sourceVersion":  "280.33",
-		"timingProtocol": "NTP",
-		"timingPort":     int64(timingPort),
-		"osBuildVersion": "13F69",
-		"model":          senderPlatformName(),
-		"name":           senderPlatformName(),
-		"streams":        []interface{}{audioStreamDesc},
+	if useAudioFEC(selectedAudioCodec, audioMode == audioSecurityChaCha) {
+		audioStreamBase["redundantAudio"] = int64(2)
 	}
 
-	// Modern HAP receivers look for shk on the audio stream descriptor.
-	if audioMode == audioSecurityChaCha && len(audioChaChaKey) == 32 {
-		audioStreamDesc["shk"] = audioChaChaKey
-		audioStreamDesc["isMedia"] = true
-		audioStreamDesc["supportsDynamicStreamID"] = true
-		audioStreamDesc["streamConnections"] = map[string]interface{}{
-			"streamConnectionTypeRTP": map[string]interface{}{
-				"streamConnectionKeyUseStreamEncryptionKey": true,
-			},
-			"streamConnectionTypeRTCP": map[string]interface{}{
-				"streamConnectionKeyPort": int64(audioControlLPort),
-			},
+	// Audio encryption and descriptor shape are separate protocol axes. The
+	// advertised stream-connection capability selects the initial shape; a
+	// protocol rejection below permits one alternate-shape probe.
+	audioLayout := policy.audioConnections
+	buildAudioSetup := func(layout audioConnectionLayout) (map[string]interface{}, map[string]interface{}) {
+		stream := clonePlistMap(audioStreamBase)
+		addScreenAudioStreamFields(stream, audioChaChaKey, audioControlLPort, layout)
+		var request map[string]interface{}
+		if sessionFirstSetup {
+			request = streamOnlyPlist(stream)
+		} else {
+			request = setupRequest.legacyStreamPlist(stream)
 		}
-		dbg("[SETUP] audio stream descriptor includes shk (%d bytes)", len(audioChaChaKey))
-	} else if c.FpEkey != nil && c.fpIV != nil {
-		audioSetupPlist["et"] = int64(32)
-		audioSetupPlist["ekey"] = c.FpEkey
-		audioSetupPlist["eiv"] = c.fpIV
-		dbg("[SETUP] FairPlay ekey=%d bytes, eiv=%d bytes, et=32", len(c.FpEkey), len(c.fpIV))
-	} else {
-		dbg("[SETUP] WARNING: no FairPlay ekey/eiv — audio will likely not work")
-	}
-
-	dbg("[SETUP] phase 1 (audio+session): ct=%d spf=%d audioFormat=0x%x controlPort=%d", audioCT, audioSPF, audioFmt, audioControlLPort)
-
-	audioSetupBody, err2 := plist.Marshal(audioSetupPlist, plist.BinaryFormat)
-	if err2 != nil {
-		audioCtrlConn.Close()
-		audioDataConn.Close()
-		return nil, fmt.Errorf("marshal audio setup: %w", err2)
-	}
-
-	// The Apple TV will only respond to SETUP once it has been able to reach
-	// back to us (NTP probe to the timing UDP port and the event TCP port).
-	// If a firewall (UFW, nftables, etc.) blocks those inbound packets, the
-	// receiver just silently stalls. Emit a hint after a few seconds so users
-	// in that situation get an actionable error instead of an opaque hang.
-	setupHintDone := make(chan struct{})
-	go func() {
-		select {
-		case <-setupHintDone:
-		case <-time.After(3 * time.Second):
-			log.Printf("warning: Apple TV at %s has not responded to SETUP after 3s.", c.host)
-			log.Printf("  this usually means a host firewall is blocking the receiver's reverse handshake.")
-			log.Printf("  re-run with -port-range MIN-MAX (e.g. -port-range 60000-60010) and allow that")
-			log.Printf("  range inbound (UDP+TCP) from %s. See the Firewall section of the README.", c.host)
+		if policy.fairPlayOnStreams() {
+			if !addFairPlayRootFields(request, c.FpEkey, c.fpIV, true) && audioMode == audioSecurityLegacyAES {
+				dbg("[SETUP] WARNING: no FairPlay ekey/eiv — audio will likely not work")
+			}
 		}
-	}()
-	audioRespBody, _, err2 := c.rtspRequest("SETUP", audioURI, "application/x-apple-binary-plist", audioSetupBody, nil)
-	close(setupHintDone)
-	if err2 != nil {
-		audioCtrlConn.Close()
-		audioDataConn.Close()
-		return nil, fmt.Errorf("SETUP phase 1 (audio): %w",
-			err2)
+		return request, stream
 	}
+	audioSetupPlist, audioStreamDesc := buildAudioSetup(audioLayout)
+	debugDumpPlist("audio setup plist", audioSetupPlist)
+	debugDumpPlist("audio stream descriptor", audioStreamDesc)
 
-	var audioResp map[string]interface{}
-	if _, err2 := plist.Unmarshal(audioRespBody, &audioResp); err2 != nil {
-		audioCtrlConn.Close()
-		audioDataConn.Close()
-		return nil, fmt.Errorf("unmarshal audio setup response: %w", err2)
+	audioPhase := 1
+	videoPhase := 2
+	if sessionFirstSetup {
+		audioPhase = 2
+		videoPhase = 3
 	}
-	dbg("[SETUP] phase 1 response: %+v", audioResp)
-
-	// Log timing port from receiver if present
-	if tp, ok := audioResp["timingPort"]; ok {
-		dbg("[SETUP] Apple TV timingPort: %v", tp)
-	}
-	// Check for any audio-specific parameters
-	for k, v := range audioResp {
-		if k != "streams" && k != "eventPort" {
-			dbg("[SETUP] response field: %s=%v", k, v)
+	dbg("[SETUP] phase %d (audio): ct=%d spf=%d audioFormat=0x%x controlPort=%d", audioPhase, audioCT, audioSPF, audioFmt, audioControlLPort)
+	audioResp, audioRespHeaders, audioRespReceivedAt, err := sendSetup(audioURI, "audio stream", audioSetupPlist)
+	// Feature 59 is Apple's advertised streamConnections selector. If the peer
+	// explicitly rejects that shape (or the legacy shape selected when it is
+	// absent), negotiate the alternate descriptor exactly once. This never
+	// changes an already accepted SETUP.
+	if err != nil && setupShapeRejected(err) {
+		alternate := audioLayoutControlPort
+		if audioLayout == audioLayoutControlPort {
+			alternate = audioLayoutStreamConnections
+		}
+		dbg("[SETUP] receiver rejected %s audio descriptor; retrying with %s", audioLayoutName(audioLayout), audioLayoutName(alternate))
+		audioSetupPlist, audioStreamDesc = buildAudioSetup(alternate)
+		debugDumpPlist("alternate audio setup plist", audioSetupPlist)
+		debugDumpPlist("alternate audio stream descriptor", audioStreamDesc)
+		audioResp, audioRespHeaders, audioRespReceivedAt, err = sendSetup(audioURI, "audio stream alternate descriptor", audioSetupPlist)
+		if err == nil {
+			audioLayout = alternate
 		}
 	}
-
-	// Extract event port from audio SETUP response
-	if ep, ok := audioResp["eventPort"]; ok {
-		switch v := ep.(type) {
-		case uint64:
-			receiverEventPort = int(v)
-		case int64:
-			receiverEventPort = int(v)
-		case float64:
-			receiverEventPort = int(v)
+	if err != nil {
+		return nil, err
+	}
+	startReceiverTimingProbes(audioResp)
+	observeEventPort(audioResp)
+	if err := connectEvent(); err != nil {
+		return nil, err
+	}
+	if !sessionFirstSetup {
+		skipRecord, _ = audioResp["skipRecord"].(bool)
+		if err := configurePTPClock(audioResp, audioRespHeaders, audioRespReceivedAt); err != nil {
+			return nil, err
+		}
+		resolvedInfo := c.info
+		// A media-first receiver creates its session with the accepted audio
+		// SETUP, so this is the earliest point where its dynamic display metadata
+		// can exist. It has no combined-control response; refresh once before the
+		// video stream is configured.
+		if prepareVideoCapture != nil {
+			refreshed, refreshErr := refreshSessionInfo("post-audio")
+			if refreshErr != nil {
+				return nil, refreshErr
+			}
+			resolvedInfo = refreshed
+		}
+		if err := prepareVideo(resolvedInfo); err != nil {
+			return nil, err
 		}
 	}
 
@@ -329,15 +782,23 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			streamType := plistInt(stream["type"])
 			if streamType == 96 {
 				audioDataPort, audioControlPort = plistStreamPorts(stream)
+				if latency := plistInt(stream["arrivalToRenderLatencyMs"]); latency > 0 {
+					// This is the receiver's platform/I/O delay, not the RTP
+					// playout lead negotiated in latencyMax and TimeAnnounce.
+					dbg("[SETUP] receiver arrival-to-render latency: %dms", latency)
+				}
 				dbg("[SETUP] audio stream: dataPort=%d controlPort=%d", audioDataPort, audioControlPort)
 			}
 		}
 	}
 
-	// ---- Phase 2: SETUP video stream ----
+	// Attach the video stream to the prepared session.
 	// Video SETUP uses the same sessionUUID but a different streamConnectionID.
 	// The Apple TV attaches this video stream to the existing session.
 	videoStreamConnectionID := int64(time.Now().UnixNano() & 0x7FFFFFFFFFFFFFFF)
+	if videoStreamConnectionID == audioStreamConnectionID {
+		videoStreamConnectionID = (videoStreamConnectionID + 1) & 0x7FFFFFFFFFFFFFFF
+	}
 	videoURI := fmt.Sprintf("rtsp://%s:%d/%d", c.host, c.port, videoStreamConnectionID)
 
 	videoStreamDesc := map[string]interface{}{
@@ -358,66 +819,33 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		videoStreamDesc["shiv"] = encIV
 	}
 
-	videoSetupPlist := map[string]interface{}{
-		"deviceID":                 clientDeviceID,
-		"macAddress":               clientDeviceID,
-		"sessionUUID":              sessionUUID,
-		"sourceVersion":            "280.33",
-		"isScreenMirroringSession": true,
-		"timingProtocol":           "NTP",
-		"timingPort":               int64(timingPort),
-		"osBuildVersion":           "13F69",
-		"model":                    senderPlatformName(),
-		"name":                     senderPlatformName(),
-		"streams":                  []interface{}{videoStreamDesc},
+	var videoSetupPlist map[string]interface{}
+	if sessionFirstSetup {
+		videoSetupPlist = streamOnlyPlist(videoStreamDesc)
+	} else {
+		videoSetupPlist = setupRequest.legacyStreamPlist(videoStreamDesc)
 	}
-	// UxPlay reads ekey/eiv from the root level of the SETUP request to derive
-	// the video decryption key. Without these, video decryption won't work on UxPlay.
-	if c.FpEkey != nil && encKey != nil {
-		videoSetupPlist["ekey"] = c.FpEkey
-		videoSetupPlist["eiv"] = encIV
-		dbg("[SETUP] video SETUP includes FairPlay ekey=%d bytes, eiv=%d bytes", len(c.FpEkey), len(encIV))
+	// Legacy FairPlay sessions derive video keys from material at the SETUP root,
+	// independent of whether the plist is stream-only.
+	if policy.fairPlayOnStreams() && encKey != nil {
+		addFairPlayRootFields(videoSetupPlist, c.FpEkey, encIV, false)
 	}
-	dbg("[SETUP] phase 2 (video): streamConnectionID=%d", videoStreamConnectionID)
+	dbg("[SETUP] phase %d (video): streamConnectionID=%d", videoPhase, videoStreamConnectionID)
 
-	var dataConn net.Conn
 	var dataPort int
-	videoSetupBody, err := plist.Marshal(videoSetupPlist, plist.BinaryFormat)
+	videoResp, _, _, err := sendSetup(videoURI, "video stream", videoSetupPlist)
 	if err != nil {
-		return nil, fmt.Errorf("marshal video setup: %w", err)
+		return nil, err
 	}
+	startReceiverTimingProbes(videoResp)
+	observeEventPort(videoResp)
 
-	videoRespBody, _, err := c.rtspRequest("SETUP", videoURI, "application/x-apple-binary-plist", videoSetupBody, nil)
-	if err != nil {
-		return nil, fmt.Errorf("SETUP phase 2 (video): %w", err)
-	}
-
-	var videoResp map[string]interface{}
-	if _, err := plist.Unmarshal(videoRespBody, &videoResp); err != nil {
-		return nil, fmt.Errorf("unmarshal video setup response: %w", err)
-	}
-	dbg("[SETUP] phase 2 response: %+v", videoResp)
-	if receiverEventPort == 0 {
-		if ep, ok := videoResp["eventPort"]; ok {
-			switch v := ep.(type) {
-			case uint64:
-				receiverEventPort = int(v)
-			case int64:
-				receiverEventPort = int(v)
-			case float64:
-				receiverEventPort = int(v)
-			}
+	if receiverEventConn == nil {
+		if err := connectEvent(); err != nil {
+			return nil, err
 		}
-	}
-
-	// Connect to receiver event port if available.
-	if receiverEventPort > 0 {
-		eventAddr := net.JoinHostPort(c.host, strconv.Itoa(receiverEventPort))
-		receiverEventConn, err = net.DialTimeout("tcp", eventAddr, 3*time.Second)
-		if err != nil {
-			dbg("[EVENT] connect to receiver event port %s failed: %v", eventAddr, err)
-		} else {
-			dbg("[EVENT] connected to receiver event port %s", eventAddr)
+		if receiverEventConn == nil {
+			dbg("[EVENT] receiver omitted or declined the optional event channel; continuing without it")
 		}
 	}
 
@@ -451,73 +879,52 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	}
 	dbg("[SETUP] data channel connected: %s (TCP_NODELAY, sndbuf=64K)", dataAddr)
 
-	// ---- RECORD to start the session ----
-	recordHeaders := map[string]string{
-		"Session":  sessionUUID,
-		"Range":    "npt=0-",
-		"RTP-Info": "seq=0;rtptime=0",
-	}
-	recordBody, recordRespHeaders, err := c.rtspRequest("RECORD", audioURI, "", nil, recordHeaders)
-	if err != nil {
-		return nil, fmt.Errorf("RECORD: %w", err)
-	}
-	if recordRespHeaders != nil {
-		dbg("[SETUP] RECORD response headers: %+v", recordRespHeaders)
-	}
-	if len(recordBody) > 0 {
-		dbg("[SETUP] RECORD response body: %02x", recordBody)
-	}
-	if value, ok := recordRespHeaders["audio-latency"]; ok {
-		parsed, parseErr := strconv.ParseUint(value, 10, 32)
-		if parseErr != nil {
-			dbg("[SETUP] invalid Audio-Latency header %q: %v", value, parseErr)
-		} else if parsed > 0 {
-			// The receiver reported its authoritative playout latency. Drive both
-			// audio and video from it so they stay in sync (the anchor lead is the
-			// shared playout time), overriding our conservative fallback floor.
-			audioLatencySamples = uint32(parsed)
-			sessionLatency = time.Duration(audioLatencySamples) * time.Second / 44100
-			dbg("[SETUP] receiver audio latency: %d samples (%v); using for audio+video", audioLatencySamples, sessionLatency)
+	// Legacy receivers prepare the session with their combined audio SETUP and
+	// start it only after both streams exist.
+	if !sessionFirstSetup {
+		if skipRecord {
+			dbg("[SETUP] receiver returned skipRecord=true; session was started by SETUP")
+		} else if err := recordSession(); err != nil {
+			return nil, err
 		}
 	}
 
-	// Set volume to maximum (0 dB)
-	volumeBody := []byte("volume: 0.000000\r\n")
+	// Set volume to 0 dB (full scale). Positive dB values are invalid here and
+	// current receivers may interpret them as zero gain.
+	volumeBody := audioVolumeBody(false)
 	_, _, err = c.rtspRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil)
 	if err != nil {
 		dbg("[SETUP] SET_PARAMETER volume failed (non-fatal): %v", err)
 	} else {
-		dbg("[SETUP] SET_PARAMETER volume=0 (max) sent")
+		dbg("[SETUP] SET_PARAMETER volume=0 sent")
 	}
 	// Send volume twice (pcap shows real senders do this)
 	_, _, _ = c.rtspRequest("SET_PARAMETER", audioURI, "text/parameters", volumeBody, nil)
+
+	if timingProtocol == timingProtocolPTP {
+		// PTP uses the receiver's fixed 319/320 ports. The first socket was only
+		// reserved while allocating consecutive audio control/data ports.
+		_ = timingConn.Close()
+		timingConn = nil
+	}
 
 	session := &MirrorSession{
 		client:         c,
 		dataConn:       dataConn,
 		eventConn:      receiverEventConn,
-		eventListener:  eventListener,
+		cancel:         cancelSession,
 		DataPort:       dataPort,
 		firstFrameSent: make(chan struct{}),
 		noAudio:        cfg.NoAudio,
-		sessionURI:     controlURI,
+		sessionURI:     audioURI,
 		timingConn:     timingConn,
 		timestampBias:  sessionLatency,
+		timingProtocol: timingProtocol,
+		mediaClock:     clock,
 	}
 
-	// Presentation (display) size advertised in the codec header. Genuine senders
-	// report the receiver's display size here so the receiver can center content
-	// whose aspect ratio differs from the display (e.g. portrait content on a
-	// landscape TV). When the receiver does not advertise a usable display size,
-	// these stay zero and sendCodecFrame falls back to the encoded content size.
-	if dw, dh := c.info.DisplaySize(); dw > 0 && dh > 0 {
-		session.displayWidth, session.displayHeight = dw, dh
-		dbg("[SETUP] receiver display size: %dx%d", dw, dh)
-	}
-
-	// Set up video cipher.
-	// AppleTV (encrypted pair-verify) uses ChaCha20-Poly1305 with HKDF-derived key.
-	// UxPlay (plaintext pair-verify) uses AES-CTR with SHA-512-derived key.
+	// Set up the video cipher. Encrypted pair-verify uses ChaCha20-Poly1305 with
+	// an HKDF-derived key; plaintext pair-verify uses AES-CTR.
 	if encKey != nil && c.encrypted && ((c.PairKeys != nil && len(c.PairKeys.SharedSecret) > 0) || c.fpAesKey != nil) {
 		// ChaCha20-Poly1305 path: HKDF-SHA512 key derivation.
 		// The receiver's _GetDataStreamSecurityKeys calls the FP helper's HKDF method.
@@ -532,12 +939,10 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		}
 		chachaKey, err := deriveChaChaKey(ikm, videoStreamConnectionID)
 		if err != nil {
-			dataConn.Close()
 			return nil, fmt.Errorf("derive chacha key: %w", err)
 		}
 		aead, err := chacha20poly1305.New(chachaKey)
 		if err != nil {
-			dataConn.Close()
 			return nil, fmt.Errorf("chacha20poly1305: %w", err)
 		}
 		session.chachaCipher = aead
@@ -563,7 +968,6 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		dbg("[SETUP] cipher IV:        %02x", cipherIV)
 		mc, err := newMirrorCipher(cipherKey, cipherIV)
 		if err != nil {
-			dataConn.Close()
 			return nil, fmt.Errorf("stream cipher: %w", err)
 		}
 		session.streamCipher = mc.EncryptFrame
@@ -604,12 +1008,67 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		}()
 	}
 
-	// Start heartbeat in background
-	go session.heartbeatLoop(ctx, controlURI, sessionUUID)
-	go session.dataHeartbeatLoop(ctx)
-	go session.feedbackLoop(ctx, controlURI)
+	// Keep video alive with the data-channel heartbeat and /feedback. Do not
+	// additionally send GET_PARAMETER on this RTSP connection: some receivers
+	// leave it unanswered, and every control request is serialized on the same
+	// connection. A stuck GET_PARAMETER would therefore block /feedback long
+	// enough for the receiver to stop rendering video while audio continues.
+	session.startWorker(func() { session.dataHeartbeatLoop(sessionCtx) })
+	session.startWorker(func() { session.feedbackLoop(sessionCtx) })
 
+	setupSucceeded = true
 	return session, nil
+}
+
+func addModernScreenAudioStreamFields(stream map[string]interface{}, key []byte, controlPort int) {
+	// Modern connection dictionaries replace the legacy top-level controlPort.
+	delete(stream, "controlPort")
+	if len(key) > 0 {
+		stream["shk"] = key
+	} else {
+		delete(stream, "shk")
+	}
+	// Screen audio is routed separately from the receiver's primary media
+	// session. usingScreen identifies it as screen audio; isMedia=true instead
+	// sends grouped Apple TVs through the main-media readiness path and can leave
+	// their audio output waiting indefinitely.
+	stream["isMedia"] = false
+	stream["supportsDynamicStreamID"] = true
+	stream["streamConnections"] = map[string]interface{}{
+		"streamConnectionTypeRTP": map[string]interface{}{
+			"streamConnectionKeyUseStreamEncryptionKey": len(key) > 0,
+		},
+		"streamConnectionTypeRTCP": map[string]interface{}{
+			"streamConnectionKeyPort": int64(controlPort),
+		},
+	}
+}
+
+func addScreenAudioStreamFields(stream map[string]interface{}, key []byte, controlPort int, layout audioConnectionLayout) {
+	if layout == audioLayoutStreamConnections {
+		addModernScreenAudioStreamFields(stream, key, controlPort)
+		dbg("[SETUP] audio stream descriptor includes shk (%d bytes) with streamConnections", len(key))
+		return
+	}
+
+	stream["controlPort"] = int64(controlPort)
+	if len(key) == chacha20poly1305.KeySize {
+		stream["shk"] = key
+		dbg("[SETUP] audio stream descriptor includes shk (%d bytes) with legacy controlPort", len(key))
+	}
+}
+
+func addFairPlayRootFields(request map[string]interface{}, ekey, eiv []byte, includeEncryptionType bool) bool {
+	if len(ekey) == 0 || len(eiv) == 0 {
+		return false
+	}
+	request["ekey"] = ekey
+	request["eiv"] = eiv
+	if includeEncryptionType {
+		request["et"] = int64(32)
+	}
+	dbg("[SETUP] FairPlay root fields: ekey=%d bytes, eiv=%d bytes", len(ekey), len(eiv))
+	return true
 }
 
 // StreamFrames reads H.264 frames from the capture pipeline and sends them to the Apple TV.
@@ -632,15 +1091,14 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 	parser := newH264Parser()
 
 	var latestSPS, latestPPS []byte // raw NAL data WITHOUT start code
+	var sentSPS, sentPPS []byte     // most recently advertised decoder configuration
 	var vclBuf []byte               // AVCC-formatted data accumulating for current access unit
 	var pendingKeyframe bool        // true if vclBuf contains IDR slice(s)
 	var codecSent bool              // true if codec frame sent for current keyframe
 	var streamPrimed bool           // true after first SPS/PPS+IDR has been sent
 	var frameCount int
+	var lastProgressLog time.Time
 	var nalLog strings.Builder
-
-	// Congestion controller: EWMA-smoothed send rate vs. bitrate budget.
-	// Graduated response avoids oscillating between "all frames" and "no frames".
 	cc := newCongestionController()
 
 	// flushVCL sends the accumulated VCL data as a single encrypted frame.
@@ -660,19 +1118,19 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 				return nil
 			}
 		}
-
-		// Graduated P-frame dropping based on congestion level.
-		// Keyframes are never dropped — the decoder needs them.
 		if !pendingKeyframe && cc.shouldDrop(frameCount) {
 			vclBuf = vclBuf[:0]
 			nalLog.Reset()
 			return nil
 		}
 
-		packetTimestamp := s.ntpTimeNow()
+		packetTimestamp, packetTimeline := s.frameTimeNow()
 
-		// Send SPS+PPS as unencrypted avcC codec frame before keyframes
-		if pendingKeyframe && !codecSent && latestSPS != nil && latestPPS != nil {
+		// Send SPS+PPS as an unencrypted avcC codec frame initially and whenever
+		// the encoder changes them. Repeating an identical configuration before
+		// every IDR is unnecessary and some receivers treat it as reconfiguration.
+		if pendingKeyframe && !codecSent && latestSPS != nil && latestPPS != nil &&
+			codecConfigNeedsSend(streamPrimed, latestSPS, latestPPS, sentSPS, sentPPS) {
 			// Derive the encoded content dimensions from the SPS itself so the
 			// codec header reports exactly what the encoder produced, regardless
 			// of the captured surface size (which we no longer pin to a config
@@ -688,14 +1146,10 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 			if err := s.sendCodecFrame(avcC, packetTimestamp); err != nil {
 				return fmt.Errorf("send codec: %w", err)
 			}
-			// Signal that the first frame has been sent (unblocks data heartbeat)
-			select {
-			case <-s.firstFrameSent:
-			default:
-				close(s.firstFrameSent)
-			}
 			codecSent = true
 			streamPrimed = true
+			sentSPS = append(sentSPS[:0], latestSPS...)
+			sentPPS = append(sentPPS[:0], latestPPS...)
 		}
 
 		frameData := vclBuf
@@ -720,14 +1174,28 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		nalLog.Reset()
 
 		sendStart := time.Now()
-		if err := s.sendFrame(frameData, pendingKeyframe, packetTimestamp); err != nil {
+		if err := s.sendFrame(frameData, pendingKeyframe, packetTimestamp, packetTimeline); err != nil {
 			return fmt.Errorf("send %s: %w", keyframeStr, err)
 		}
 		cc.recordSend(len(frameData)+128, time.Since(sendStart))
+		// Codec configuration alone is not a displayed picture. Start audio and
+		// data heartbeats only after the receiver has a successfully written VCL
+		// frame to present against the shared media clock.
+		if frameCount == 0 {
+			select {
+			case <-s.firstFrameSent:
+			default:
+				close(s.firstFrameSent)
+			}
+		}
 		vclBuf = vclBuf[:0]
 		pendingKeyframe = false
 		codecSent = false
 		frameCount++
+		if time.Since(lastProgressLog) >= 5*time.Second {
+			dbg("[STREAM] video progress: sent frame %d (%s, %d bytes)", frameCount, keyframeStr, len(frameData))
+			lastProgressLog = time.Now()
+		}
 		return nil
 	}
 
@@ -824,6 +1292,10 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 			}
 		}
 	}
+}
+
+func codecConfigNeedsSend(streamPrimed bool, latestSPS, latestPPS, sentSPS, sentPPS []byte) bool {
+	return !streamPrimed || !bytes.Equal(latestSPS, sentSPS) || !bytes.Equal(latestPPS, sentPPS)
 }
 
 func min(a, b int) int {
@@ -1177,25 +1649,18 @@ func (s *MirrorSession) sendCodecFrame(payload []byte, ntpTimestamp uint64) erro
 	header[6] = 0x16 // h264 SPS+PPS option
 	header[7] = 0x01
 	binary.LittleEndian.PutUint64(header[8:16], ntpTimestamp)
-	// Mirror codec header dimension fields (see RPiPlay raop_rtp_mirror.c):
-	//   offset 40/44 = width_source/height_source = the encoded content size
-	//   offset 56/60 = width/height               = the presentation/display size
-	// Genuine senders set the display size to the receiver's display so the
-	// receiver can center/pillarbox content whose aspect ratio differs from the
-	// display (e.g. portrait content on a landscape TV). Sending the content size
-	// for both makes the Apple TV anchor the surface at the top-left instead of
-	// centering it. When the receiver advertised no display size, fall back to
-	// the content size.
-	dispW, dispH := s.displayWidth, s.displayHeight
-	if dispW <= 0 || dispH <= 0 {
-		dispW, dispH = s.videoWidth, s.videoHeight
-	}
+	// APScreenProtocolHeader carries the encoded video size followed by source
+	// and destination CGRects. Genuine senders populate the rects from sample
+	// buffer metadata. Our capture has no separate placement metadata, so both
+	// rects describe the complete encoded raster with zero origins. The receiver's
+	// advertised display size is a decoder/capture constraint, not a substitute
+	// destination rect.
 	putFloat32LE(header[16:20], float32(s.videoWidth))
 	putFloat32LE(header[20:24], float32(s.videoHeight))
 	putFloat32LE(header[40:44], float32(s.videoWidth))
 	putFloat32LE(header[44:48], float32(s.videoHeight))
-	putFloat32LE(header[56:60], float32(dispW))
-	putFloat32LE(header[60:64], float32(dispH))
+	putFloat32LE(header[56:60], float32(s.videoWidth))
+	putFloat32LE(header[60:64], float32(s.videoHeight))
 
 	dbg("[SEND] codec frame: seq=%d payLen=%d hdr[4:6]=%02x%02x ts=%d",
 		s.frameSeq, len(payload), header[4], header[5], ntpTimestamp)
@@ -1212,15 +1677,15 @@ func (s *MirrorSession) sendCodecFrame(payload []byte, ntpTimestamp uint64) erro
 
 // sendFrame writes a single encrypted VCL frame with the mirroring protocol header.
 // payload must be AVCC-encoded (4-byte BE length per NALU, no start codes).
-// Header layout (128 bytes):
+// Header layout (128 bytes), matching APScreenProtocolHeader:
 //
 //	[0:4]   payload size (LE uint32)
 //	[4]     payload type: 0x00 = encrypted video data
 //	[5]     0x10 = IDR (keyframe), 0x00 = non-IDR
 //	[6:8]   payload option: 0x00 0x00 for encrypted packets
-//	[8:16]  NTP timestamp (LE uint64, boot-relative)
-//	[16:128] zeroed (no image-size data for VCL packets)
-func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, ntpTimestamp uint64) error {
+//	[8:16]  NTP network time (LE seconds.32-bit-fraction)
+//	[40:48] timeline ID (zero for NTP, receiver ClockID for PTP)
+func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, networkTimestamp, timelineID uint64) error {
 	s.frameSeq++
 
 	// For ChaCha20-Poly1305, the header size includes the 16-byte Poly1305 tag.
@@ -1238,7 +1703,8 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, ntpTimestamp u
 		header[5] = 0x00 // non-IDR
 	}
 	// header[6:8] = 0x00 0x00 for encrypted packets (already zeroed)
-	binary.LittleEndian.PutUint64(header[8:16], ntpTimestamp)
+	binary.LittleEndian.PutUint64(header[8:16], networkTimestamp)
+	binary.LittleEndian.PutUint64(header[40:48], timelineID)
 
 	var framePayload []byte
 	if s.chachaCipher != nil {
@@ -1271,8 +1737,10 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, ntpTimestamp u
 		dbg("[SEND] %s full header: %02x", keyframeStr, header)
 	}
 
-	dbg("[SEND] %s frame: seq=%d payLen=%d hdr[4:6]=%02x%02x ts=%d",
-		keyframeStr, s.frameSeq, len(auData), header[4], header[5], ntpTimestamp)
+	if s.frameSeq <= 3 || s.frameSeq%300 == 0 {
+		dbg("[SEND] %s frame: seq=%d payLen=%d hdr[4:6]=%02x%02x ts=%d",
+			keyframeStr, s.frameSeq, len(auData), header[4], header[5], networkTimestamp)
+	}
 
 	// Use vectored I/O (writev) to send header + payload in a single syscall,
 	// avoiding a copy into a combined buffer.
@@ -1287,10 +1755,10 @@ func (s *MirrorSession) sendFrame(auData []byte, isKeyframe bool, ntpTimestamp u
 	return err
 }
 
-// writeFull writes all bytes to conn, handling short writes from net.Conn.Write.
-func writeFull(conn net.Conn, data []byte) error {
+// writeAll handles short writes from an io.Writer.
+func writeAll(writer io.Writer, data []byte) error {
 	for len(data) > 0 {
-		n, err := conn.Write(data)
+		n, err := writer.Write(data)
 		if err != nil {
 			return err
 		}
@@ -1306,23 +1774,16 @@ func putFloat32LE(dst []byte, value float32) {
 	binary.LittleEndian.PutUint32(dst, math.Float32bits(value))
 }
 
-// ---------------------------------------------------------------------------
-// congestionController — EWMA-based send-rate tracker with graduated response
-// ---------------------------------------------------------------------------
-
-// congestionLevel represents the graduated congestion state.
 type congestionLevel int
 
 const (
-	congestionNone   congestionLevel = 0 // send every frame
-	congestionLight  congestionLevel = 1 // drop every 3rd P-frame
-	congestionMedium congestionLevel = 2 // drop every 2nd P-frame
-	congestionHeavy  congestionLevel = 3 // drop every P-frame
+	congestionNone congestionLevel = iota
+	congestionLight
+	congestionMedium
+	congestionHeavy
 )
 
 type congestionController struct {
-	// EWMA of write duration per byte (nanoseconds/byte). A rising value
-	// means the TCP send buffer is filling up, i.e. the link is saturated.
 	ewmaNsPerByte float64
 	samples       int
 	level         congestionLevel
@@ -1334,28 +1795,18 @@ func newCongestionController() *congestionController {
 	return &congestionController{}
 }
 
-// recordSend updates the EWMA with one frame's write timing and adjusts the
-// congestion level. Called after every successful sendFrame.
 func (cc *congestionController) recordSend(bytes int, dur time.Duration) {
 	if bytes <= 0 {
 		return
 	}
 	nsPerByte := float64(dur.Nanoseconds()) / float64(bytes)
-
-	const alpha = 0.3 // weight of new sample (reacts in ~3 frames)
+	const alpha = 0.3
 	if cc.samples == 0 {
 		cc.ewmaNsPerByte = nsPerByte
 	} else {
 		cc.ewmaNsPerByte = alpha*nsPerByte + (1-alpha)*cc.ewmaNsPerByte
 	}
 	cc.samples++
-
-	// Thresholds in ns/byte. On Wi-Fi, kernel-buffered writes typically
-	// complete in 10-500 ns/byte even under normal load. Only trigger
-	// congestion when the socket is clearly blocking for extended periods.
-	//   light:  ~50ms per 5KB frame  → 10000 ns/byte
-	//   medium: ~100ms per 5KB frame → 20000 ns/byte
-	//   heavy:  ~250ms per 5KB frame → 50000 ns/byte
 	switch {
 	case cc.ewmaNsPerByte > 50000:
 		cc.setLevel(congestionHeavy)
@@ -1368,47 +1819,34 @@ func (cc *congestionController) recordSend(bytes int, dur time.Duration) {
 	}
 }
 
-func (cc *congestionController) setLevel(l congestionLevel) {
-	if l != cc.level {
-		if l > congestionNone {
-			log.Printf("[STREAM] congestion level %d → %d (ewma %.0f ns/byte)", cc.level, l, cc.ewmaNsPerByte)
-		} else if cc.skipped > 0 {
-			log.Printf("[STREAM] congestion cleared after skipping %d frames", cc.skipped)
-			cc.skipped = 0
-		}
-		cc.level = l
+func (cc *congestionController) setLevel(level congestionLevel) {
+	if level == cc.level {
+		return
 	}
+	if level > congestionNone {
+		log.Printf("[STREAM] congestion level %d -> %d (ewma %.0f ns/byte)", cc.level, level, cc.ewmaNsPerByte)
+	} else if cc.skipped > 0 {
+		log.Printf("[STREAM] congestion cleared after skipping %d frames", cc.skipped)
+		cc.skipped = 0
+	}
+	cc.level = level
 }
 
-// shouldDrop returns true if the current frame (identified by count) should be
-// dropped based on the congestion level. Keyframes are never passed here.
 func (cc *congestionController) shouldDrop(frameCount int) bool {
-	switch cc.level {
-	case congestionLight:
-		if frameCount%3 == 0 {
-			cc.skipped++
-			cc.logDrop()
-			return true
-		}
-	case congestionMedium:
-		if frameCount%2 == 0 {
-			cc.skipped++
-			cc.logDrop()
-			return true
-		}
-	case congestionHeavy:
+	drop := cc.level == congestionHeavy ||
+		(cc.level == congestionMedium && frameCount%2 == 0) ||
+		(cc.level == congestionLight && frameCount%3 == 0)
+	if drop {
 		cc.skipped++
 		cc.logDrop()
-		return true
 	}
-	return false
+	return drop
 }
 
 func (cc *congestionController) logDrop() {
 	now := time.Now()
 	if now.Sub(cc.lastLog) > 500*time.Millisecond {
-		dbg("[STREAM] congestion: dropped %d P-frame(s) (level %d, ewma %.0f ns/byte)",
-			cc.skipped, cc.level, cc.ewmaNsPerByte)
+		dbg("[STREAM] congestion: dropped %d P-frame(s) (level %d, ewma %.0f ns/byte)", cc.skipped, cc.level, cc.ewmaNsPerByte)
 		cc.lastLog = now
 	}
 }
@@ -1461,37 +1899,6 @@ func deriveChaChaKey(ikm []byte, streamConnectionID int64) ([]byte, error) {
 	return key, nil
 }
 
-// heartbeatLoop sends periodic GET_PARAMETER requests to keep the session alive.
-// Some receivers (e.g. Apple TV) may return 400 for GET_PARAMETER; in that case
-// we silently stop — the /feedback POST and data-channel heartbeat provide
-// redundant keepalive.
-func (s *MirrorSession) heartbeatLoop(ctx context.Context, uri, sessionID string) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	consecutiveFailures := 0
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			_, _, err := s.client.rtspRequest("GET_PARAMETER", uri, "", nil, map[string]string{
-				"Session": sessionID,
-			})
-			if err != nil {
-				consecutiveFailures++
-				dbg("[HEARTBEAT] GET_PARAMETER failed (%d): %v", consecutiveFailures, err)
-				if consecutiveFailures >= 3 {
-					dbg("[HEARTBEAT] disabling GET_PARAMETER after %d failures", consecutiveFailures)
-					return
-				}
-			} else {
-				consecutiveFailures = 0
-			}
-		}
-	}
-}
-
 // dataHeartbeatLoop sends periodic heartbeat frames on the data channel.
 // AirMyPC sends these every ~1s: 128-byte header with byte4=0x02, bytes6-7=0x1e00, no payload.
 // Waits until the first video frame has been sent before starting.
@@ -1516,7 +1923,7 @@ func (s *MirrorSession) dataHeartbeatLoop(ctx context.Context) {
 			header[6] = 0x1e
 			s.dataMu.Lock()
 			s.dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			err := writeFull(s.dataConn, header)
+			err := writeAll(s.dataConn, header)
 			s.dataMu.Unlock()
 			if err != nil {
 				dbg("[HEARTBEAT] data channel heartbeat failed: %v", err)
@@ -1529,26 +1936,35 @@ func (s *MirrorSession) dataHeartbeatLoop(ctx context.Context) {
 // feedbackLoop sends periodic POST /feedback requests like AirMyPC (every 2s).
 // Sends an immediate first feedback to prevent UxPlay's 3-second timeout from
 // killing the connection before the first ticker fires.
-func (s *MirrorSession) feedbackLoop(ctx context.Context, uri string) {
-	// Wait for first video frame before sending feedback
-	select {
-	case <-ctx.Done():
-		return
-	case <-s.firstFrameSent:
-	}
-
-	// Send immediate first feedback — iPhone does this within ~1s of streaming
-	body, _, err := s.client.rtspRequest("POST", "/feedback", "", nil, nil)
-	if err != nil {
-		dbg("[FEEDBACK] initial error: %v", err)
-	} else if len(body) > 0 {
+func (s *MirrorSession) feedbackLoop(ctx context.Context) {
+	// Start immediately after SETUP. Wayland's permission UI can delay the first
+	// captured frame for several seconds, but the receiver's feedback timeout is
+	// already running by then.
+	sendFeedback := func() {
+		body, headers, err := s.client.rtspRequest("POST", "/feedback", "", nil, nil)
+		receivedAt := time.Now()
+		if err != nil {
+			dbg("[FEEDBACK] error: %v", err)
+			return
+		}
+		if s.mediaClock != nil {
+			if err := s.mediaClock.reanchor(headers, receivedAt); err != nil {
+				dbg("[PTP] feedback clock update ignored: %v", err)
+			}
+		}
+		if len(body) == 0 {
+			return
+		}
 		var fbResp map[string]interface{}
-		if _, perr := plist.Unmarshal(body, &fbResp); perr == nil {
+		if _, err := plist.Unmarshal(body, &fbResp); err == nil {
 			dbg("[FEEDBACK] response: %+v", fbResp)
 		} else {
 			dbg("[FEEDBACK] response (%d bytes): %02x", len(body), body)
 		}
 	}
+
+	// Send immediate first feedback — iPhone does this within ~1s of streaming.
+	sendFeedback()
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -1560,21 +1976,26 @@ func (s *MirrorSession) feedbackLoop(ctx context.Context, uri string) {
 		case <-ticker.C:
 			// Use bare /feedback path — UxPlay matches against exact path "/feedback",
 			// not the full RTSP URI with session UUID prefix.
-			body, _, err := s.client.rtspRequest("POST", "/feedback", "", nil, nil)
-			if err != nil {
-				dbg("[FEEDBACK] error: %v", err)
-			} else if len(body) > 0 {
-				var fbResp map[string]interface{}
-				if _, perr := plist.Unmarshal(body, &fbResp); perr == nil {
-					dbg("[FEEDBACK] response: %+v", fbResp)
-				}
-			}
+			sendFeedback()
 		}
 	}
 }
 
+func (s *MirrorSession) startWorker(worker func()) {
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		worker()
+	}()
+}
+
 func (s *MirrorSession) Close() error {
 	s.closeOnce.Do(func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.workers.Wait()
+
 		// Send TEARDOWN to cleanly end the RTSP session on the receiver.
 		if s.sessionURI != "" && s.client != nil {
 			_, _, err := s.client.rtspRequest("TEARDOWN", s.sessionURI, "", nil, nil)
@@ -1583,19 +2004,15 @@ func (s *MirrorSession) Close() error {
 			} else {
 				dbg("[TEARDOWN] sent for %s", s.sessionURI)
 			}
-			s.sessionURI = ""
 		}
 		if s.audioStream != nil {
 			s.audioStream.Close()
 		}
 		if s.eventConn != nil {
-			s.eventConn.Close()
+			_ = s.eventConn.Close()
 		}
 		if s.timingConn != nil {
-			s.timingConn.Close()
-		}
-		if s.eventListener != nil {
-			s.eventListener.Close()
+			_ = s.timingConn.Close()
 		}
 		if s.dataConn != nil {
 			s.closeErr = s.dataConn.Close()
@@ -1609,12 +2026,45 @@ func plistInt(v interface{}) int {
 	switch n := v.(type) {
 	case uint64:
 		return int(n)
+	case uint32:
+		return int(n)
 	case int64:
 		return int(n)
+	case int32:
+		return int(n)
+	case int:
+		return n
 	case float64:
 		return int(n)
 	}
 	return 0
+}
+
+func plistUint64(v interface{}) uint64 {
+	switch n := v.(type) {
+	case uint64:
+		return n
+	case uint32:
+		return uint64(n)
+	case int64:
+		return uint64(n)
+	case int32:
+		return uint64(n)
+	case int:
+		return uint64(n)
+	}
+	return 0
+}
+
+func localIPForConnection(conn net.Conn) (string, error) {
+	if conn == nil {
+		return "", fmt.Errorf("connection is not open")
+	}
+	address, ok := conn.LocalAddr().(*net.TCPAddr)
+	if !ok || address.IP == nil || address.IP.IsUnspecified() {
+		return "", fmt.Errorf("connection has unusable local address %v", conn.LocalAddr())
+	}
+	return address.IP.String(), nil
 }
 
 // plistStreamPorts extracts RTP/RTCP ports from either legacy stream fields or
@@ -1652,15 +2102,17 @@ func (s *MirrorSession) SetAudioMuted(muted bool) error {
 		return fmt.Errorf("audio control unavailable")
 	}
 
-	volume := "0.000000"
-	if muted {
-		volume = "-144.000000"
-	}
-	body := []byte("volume: " + volume + "\r\n")
-	if _, _, err := s.client.rtspRequest("SET_PARAMETER", s.sessionURI, "text/parameters", body, nil); err != nil {
+	if _, _, err := s.client.rtspRequest("SET_PARAMETER", s.sessionURI, "text/parameters", audioVolumeBody(muted), nil); err != nil {
 		return fmt.Errorf("set audio muted=%t: %w", muted, err)
 	}
 	return nil
+}
+
+func audioVolumeBody(muted bool) []byte {
+	if muted {
+		return []byte("volume: -144.000000\r\n")
+	}
+	return []byte("volume: 0.000000\r\n")
 }
 
 // AudioStream returns the audio stream for this session (may be nil).
@@ -1689,7 +2141,10 @@ func ntpTimingResponder(ctx context.Context, conn net.PacketConn) {
 		}
 		dbg("[NTP] received %d bytes from %s: %02x", n, addr, buf[:min(n, 32)])
 
-		if n < 32 {
+		// 0xd2 is the timing request and 0xd3 its response. A receiver may
+		// answer a sender-initiated probe on this same socket; never answer that
+		// response or the peers form a response loop.
+		if !isNTPTimingRequest(buf[:n]) {
 			continue
 		}
 
@@ -1724,6 +2179,47 @@ func ntpTimingResponder(ctx context.Context, conn net.PacketConn) {
 	}
 }
 
+func isNTPTimingRequest(packet []byte) bool {
+	return len(packet) >= 32 && packet[0] == 0x80 && packet[1] == 0xd2
+}
+
+// sendNTPTimingProbes initiates timing with receivers that return their own
+// timingPort instead of probing the sender's advertised port. The responder on
+// conn consumes and ignores the corresponding 0xd3 packets.
+func sendNTPTimingProbes(ctx context.Context, conn net.PacketConn, host string, port int) {
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		dbg("[NTP] resolve receiver timing port: %v", err)
+		return
+	}
+	for sequence := uint16(1); sequence <= 3; sequence++ {
+		request := make([]byte, 32)
+		request[0], request[1] = 0x80, 0xd2
+		binary.BigEndian.PutUint16(request[2:4], sequence)
+		binary.BigEndian.PutUint64(request[24:32], ntpBootTimestamp())
+		if _, err := conn.WriteTo(request, addr); err != nil {
+			dbg("[NTP] send timing probe to %s: %v", addr, err)
+			return
+		}
+		if sequence == 3 {
+			return
+		}
+
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+	}
+}
+
 // uuidToMAC converts a UUID-ish string to a stable locally-administered MAC address.
 // Falls back to a fixed MAC if the UUID does not contain enough hex digits.
 func uuidToMAC(id string) string {
@@ -1744,7 +2240,7 @@ func uuidToMAC(id string) string {
 	return strings.ToUpper(strings.Join(parts, ":"))
 }
 
-// appStartTime is the reference point for boot-relative timestamps.
+// appStartTime is the fallback reference when a system boot clock is unavailable.
 var appStartTime = time.Now()
 
 // ntpTimeNow returns a 64-bit NTP fixed-point timestamp for mirroring frame headers.
@@ -1766,19 +2262,50 @@ func ntpTimeNow() uint64 {
 	return ntpTimeWithBias(videoTimestampBias())
 }
 
-func (s *MirrorSession) ntpTimeNow() uint64 {
+// frameTimeNow returns one atomic timestamp/timeline pair for a VCL header.
+func (s *MirrorSession) frameTimeNow() (timestamp, timelineID uint64) {
 	bias := s.timestampBias
 	if bias <= 0 {
 		bias = videoTimestampBias()
 	}
-	return ntpTimeWithBias(bias)
+	if s.mediaClock != nil {
+		if timestamp, timelineID, ok := s.mediaClock.now(bias); ok {
+			return s.monotonicFrameTime(timestamp), timelineID
+		}
+	}
+	return s.monotonicFrameTime(ntpTimeWithBias(bias)), 0
+}
+
+func (s *MirrorSession) monotonicFrameTime(timestamp uint64) uint64 {
+	if timestamp <= s.lastFrameTimestamp {
+		timestamp = s.lastFrameTimestamp + 1
+	}
+	s.lastFrameTimestamp = timestamp
+	return timestamp
+}
+
+// audioClockNow returns the current clock time without video's playout lead.
+// The receiver applies the negotiated audio latency separately.
+func (s *MirrorSession) audioClockNow() (timestamp, timelineID uint64) {
+	if s.mediaClock != nil {
+		if timestamp, timelineID, ok := s.mediaClock.now(0); ok {
+			return timestamp, timelineID
+		}
+	}
+	return ntpBootTimestamp(), 0
 }
 
 func ntpTimeWithBias(bias time.Duration) uint64 {
 	if bias < 5*time.Millisecond {
 		bias = 5 * time.Millisecond
 	}
-	d := time.Since(appStartTime) + bias
+	return compactTimestamp(bootRelativeNow() + bias)
+}
+
+func compactTimestamp(d time.Duration) uint64 {
+	if d < 0 {
+		d = 0
+	}
 	sec := uint64(d / time.Second)
 	nsecFrac := uint64(d % time.Second)
 	frac := (nsecFrac << 32) / uint64(time.Second)
@@ -1846,28 +2373,6 @@ func tryConsecutiveUDP(base, count int) ([]net.PacketConn, bool) {
 	return conns, true
 }
 
-// listenTCPInRange opens a TCP listener within [portMin, portMax], skipping
-// ports that overlap the audio UDP triple [skipBase, skipBase+2]. When the
-// range is zero, the OS picks an ephemeral port.
-func listenTCPInRange(portMin, portMax, skipBase int) (net.Listener, error) {
-	if portMin == 0 && portMax == 0 {
-		return net.Listen("tcp", ":0")
-	}
-	if portMin <= 0 || portMax <= 0 || portMin > portMax {
-		return nil, fmt.Errorf("invalid TCP port range %d-%d", portMin, portMax)
-	}
-	for p := portMin; p <= portMax; p++ {
-		if skipBase > 0 && p >= skipBase && p <= skipBase+2 {
-			continue
-		}
-		l, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
-		if err == nil {
-			return l, nil
-		}
-	}
-	return nil, fmt.Errorf("no free TCP port in range %d-%d", portMin, portMax)
-}
-
 // ntpBootTimestamp returns a 64-bit NTP fixed-point timestamp using boot-relative
 // time with the NTP epoch (1900-01-01) added. UxPlay subtracts the NTP epoch from
 // timing responses (account_for_epoch=true), yielding the same boot-relative seconds
@@ -1875,7 +2380,7 @@ func listenTCPInRange(portMin, portMax, skipBase int) (net.Listener, error) {
 const secondsFrom1900To1970 = 2208988800
 
 func ntpBootTimestamp() uint64 {
-	d := time.Since(appStartTime)
+	d := bootRelativeNow()
 	sec := uint64(d/time.Second) + secondsFrom1900To1970
 	nsecFrac := uint64(d % time.Second)
 	frac := (nsecFrac << 32) / uint64(time.Second)
@@ -1891,9 +2396,6 @@ func senderPlatformName() string {
 	case "linux":
 		return "Linux"
 	default:
-		if runtime.GOOS == "" {
-			return "doubletake"
-		}
 		return runtime.GOOS
 	}
 }
@@ -1905,4 +2407,37 @@ func generateUUID() string {
 	b[8] = (b[8] & 0x3f) | 0x80 // Variant 10
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// debugDumpPlist logs a plist map in a stable key order, summarising byte
+// slices by length and hex prefix. Lets the whole SETUP descriptor be diffed
+// between receiver configurations that accept it and ones that reject it.
+func debugDumpPlist(label string, m map[string]interface{}) {
+	if !DebugMode() {
+		return
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	dbg("[SETUP] %s (%d keys):", label, len(keys))
+	for _, k := range keys {
+		switch v := m[k].(type) {
+		case []byte:
+			dbg("[SETUP]   %s = <%d bytes> %s", k, len(v), hex.EncodeToString(v[:min(len(v), 16)]))
+		case map[string]interface{}:
+			inner := make([]string, 0, len(v))
+			for ik := range v {
+				inner = append(inner, ik)
+			}
+			sort.Strings(inner)
+			dbg("[SETUP]   %s = map%v", k, inner)
+		case []interface{}:
+			dbg("[SETUP]   %s = list of %d", k, len(v))
+		default:
+			dbg("[SETUP]   %s = %v", k, v)
+		}
+	}
 }

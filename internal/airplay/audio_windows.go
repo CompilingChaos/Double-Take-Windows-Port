@@ -138,14 +138,17 @@ type audioResampler struct {
 	buf    []stereoSample
 }
 
-func StartAudioCapture(ctx context.Context, testTone bool) (*AudioCapture, error) {
-	if testTone {
-		return startWindowsTestToneCapture(ctx)
+func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*AudioCapture, error) {
+	if codec != AudioCodecALAC {
+		return nil, fmt.Errorf("%w: Windows build currently supports ALAC capture only", ErrAACELDUnavailable)
 	}
-	return startWindowsAudioCapture(ctx)
+	if testTone {
+		return startWindowsTestToneCapture(ctx, codec)
+	}
+	return startWindowsAudioCapture(ctx, codec)
 }
 
-func startWindowsAudioCapture(parent context.Context) (*AudioCapture, error) {
+func startWindowsAudioCapture(parent context.Context, codec AudioCodec) (*AudioCapture, error) {
 	ctx, cancel := context.WithCancel(parent)
 	pr, pw := io.Pipe()
 	waitCh := make(chan struct{})
@@ -163,6 +166,7 @@ func startWindowsAudioCapture(parent context.Context) (*AudioCapture, error) {
 			}
 		},
 		waitCh: waitCh,
+		codec:  codec,
 	}
 
 	go func() {
@@ -185,7 +189,7 @@ func startWindowsAudioCapture(parent context.Context) (*AudioCapture, error) {
 	return ac, nil
 }
 
-func startWindowsTestToneCapture(parent context.Context) (*AudioCapture, error) {
+func startWindowsTestToneCapture(parent context.Context, codec AudioCodec) (*AudioCapture, error) {
 	ctx, cancel := context.WithCancel(parent)
 	pr, pw := io.Pipe()
 	waitCh := make(chan struct{})
@@ -202,6 +206,7 @@ func startWindowsTestToneCapture(parent context.Context) (*AudioCapture, error) 
 			}
 		},
 		waitCh: waitCh,
+		codec:  codec,
 	}
 
 	go func() {

@@ -164,17 +164,10 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 
 			s.dataMu.Lock()
 			s.dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			err := writeFull(s.dataConn, frame)
+			err := writeAll(s.dataConn, frame)
 			s.dataMu.Unlock()
 			if err != nil {
 				return fmt.Errorf("send codec frame %d: %w", i, err)
-			}
-
-			// Signal first frame sent (unblocks heartbeat/feedback)
-			select {
-			case <-s.firstFrameSent:
-			default:
-				close(s.firstFrameSent)
 			}
 
 		case 0x00: // VCL frame (encrypted) — decrypt with original key, re-encrypt with session key
@@ -222,17 +215,24 @@ func (s *MirrorSession) ReplayFrames(ctx context.Context, cfg ReplayConfig) erro
 
 			s.dataMu.Lock()
 			s.dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			err := writeFull(s.dataConn, frame)
+			err := writeAll(s.dataConn, frame)
 			s.dataMu.Unlock()
 			if err != nil {
 				return fmt.Errorf("send VCL frame %d (sent=%d): %w", i, sentFrames, err)
+			}
+			if sentFrames == 0 {
+				select {
+				case <-s.firstFrameSent:
+				default:
+					close(s.firstFrameSent)
+				}
 			}
 			sentFrames++
 
 		case 0x02: // Heartbeat — send as-is
 			s.dataMu.Lock()
 			s.dataConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			err := writeFull(s.dataConn, f.header[:])
+			err := writeAll(s.dataConn, f.header[:])
 			s.dataMu.Unlock()
 			if err != nil {
 				return fmt.Errorf("send heartbeat frame %d: %w", i, err)

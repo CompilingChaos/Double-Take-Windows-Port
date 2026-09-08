@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -51,9 +53,14 @@ func parsePortRange(s string) (int, int, error) {
 }
 
 func main() {
-	target := flag.String("target", "", "Apple TV IP address or hostname (skip discovery)")
+	defer pauseForStandaloneConsole()
+
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	target := flag.String("target", "", "AirPlay receiver IP address or hostname (skip discovery)")
 	port := flag.Int("port", 7000, "AirPlay port")
-	pin := flag.String("pin", "", "4-digit PIN for pairing (shown on Apple TV)")
+	var credentialFlag string
+	flag.StringVar(&credentialFlag, "code", "", "Pairing code or receiver password")
+	flag.StringVar(&credentialFlag, "pin", "", "Alias for -code")
 	credFile := flag.String("creds", airplay.DefaultCredentialsPath(), "Path to saved pairing credentials")
 	credBackend := flag.String("cred-backend", "file", "Credential storage backend: file or keyring (system keyring)")
 	forcePair := flag.Bool("pair", false, "Force new pairing even if credentials exist")
@@ -69,14 +76,26 @@ func main() {
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with a local control interface")
 	socketPath := flag.String("socket", daemon.DefaultSocketPath(), "Daemon control endpoint (Unix socket path or Windows host:port)")
-	flag.Parse()
+	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		exitProgram(2)
+	}
+	portMin, portMax, err := parsePortRange(*portRange)
+	if err != nil {
+		fatalf("invalid -port-range: %v", err)
+	}
+	if err := airplay.CheckFFmpeg(); err != nil {
+		fatalf("%v", err)
+	}
 
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
-	airplay.DebugMode = *debug
+	airplay.SetDebugMode(*debug)
 
 	if *daemonize {
-		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, *hwaccel, *debug, *testMode, *noEncrypt, *directKey, *noAudio)
+		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, portMin, portMax, *hwaccel, *debug, *testMode, *noEncrypt, *directKey, *noAudio)
 		return
 	}
 
@@ -93,15 +112,16 @@ func main() {
 		go func() {
 			time.Sleep(3 * time.Second)
 			log.Println("forced exit (timeout)")
-			os.Exit(1)
+			exitProgram(1)
 		}()
 		// Also force exit on second signal
 		<-sigCh
 		log.Println("forced exit")
-		os.Exit(1)
+		exitProgram(1)
 	}()
 
 	var addr string
+	var advertisement *airplay.AirPlayDevice
 	if *target != "" {
 		addr = *target
 	} else {
@@ -111,34 +131,64 @@ func main() {
 				log.Println("selection cancelled")
 				return
 			}
-			log.Fatalf("discovery failed: %v", err)
+			fatalf("discovery failed: %v", err)
 		}
 		addr = device.IP
 		*port = device.Port
+		advertisement = device
 		fmt.Printf("selected: %s (%s:%d)\n", device.Name, device.IP, device.Port)
 	}
 
-	client := airplay.NewAirPlayClient(addr, *port)
-	if err := client.Connect(ctx); err != nil {
-		log.Fatalf("connect failed: %v", err)
+	newClient := func() *airplay.AirPlayClient {
+		if advertisement != nil {
+			device := *advertisement
+			device.IP = addr
+			device.Port = *port
+			return airplay.NewAirPlayClientForDevice(device)
+		}
+		return airplay.NewAirPlayClient(addr, *port)
 	}
-	defer client.Close()
+	credential := credentialFlag
+	if env := os.Getenv("DOUBLETAKE_CODE"); env != "" {
+		credential = env
+	}
+	client := newClient()
+	client.SetPassword(credential)
+	if err := client.Connect(ctx); err != nil {
+		fatalf("connect failed: %v", err)
+	}
+	defer func() { _ = client.Close() }()
 
 	info, err := client.GetInfo()
+	if errors.Is(err, airplay.ErrCredentialsRequired) && credential == "" {
+		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's configured password: ")
+		if credential == "" {
+			fatalf("password cannot be empty")
+		}
+		client.SetPassword(credential)
+		info, err = client.GetInfo()
+	}
 	if err != nil {
-		log.Fatalf("get info failed: %v", err)
+		fatalf("get info failed: %v", err)
 	}
 	log.Printf("connected to: %s (model: %s, initialVolume: %.1f)", info.Name, info.Model, info.InitialVolume)
+	if credential == "" && info.RequiresPassword() {
+		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's configured password: ")
+		if credential == "" {
+			fatalf("password cannot be empty")
+		}
+		client.SetPassword(credential)
+	}
 
 	// Pairing flow:
-	// 1. If --pin provided or --pair forced, do full pair-setup + save credentials
-	// 2. If saved credentials exist, load them and do pair-verify only
-	// 3. Otherwise, do transient (ephemeral) pairing
-	needFullPair := *forcePair || *pin != ""
+	// 1. If --pair is forced, do full pair-setup and save credentials.
+	// 2. If saved credentials exist, restore their negotiated protocol.
+	// 3. Otherwise choose PIN/password or transient pairing from capabilities.
+	needFullPair := *forcePair
 
 	credStore, err := newCredentialStore(*credBackend, *credFile)
 	if err != nil {
-		log.Fatalf("failed to load credentials: %v", err)
+		fatalf("failed to load credentials: %v", err)
 	}
 
 	var savedCreds *airplay.SavedCredentials
@@ -146,100 +196,82 @@ func main() {
 		savedCreds = credStore.Lookup(info.DeviceID)
 	}
 
-	if needFullPair {
-		// Full pair-setup with PIN
-		pinVal := *pin
-		if pinVal == "" {
-			// Trigger PIN display on the TV first, then ask user
-			if err := client.StartPINDisplay(); err != nil {
-				if airplay.IsHTTPStatusCode(err, 403) {
-					log.Printf("%s", airplay.PairingAccessDeniedHint(info))
-				}
-				log.Fatalf("failed to trigger PIN display: %v", err)
-			}
-			fmt.Print("Enter the PIN shown on Apple TV: ")
-			fmt.Scanln(&pinVal)
+	reconnect := func() {
+		_ = client.Close()
+		client = newClient()
+		client.SetPassword(credential)
+		if err := client.Connect(ctx); err != nil {
+			fatalf("reconnect failed: %v", err)
 		}
-		if err := client.Pair(ctx, pinVal); err != nil {
-			log.Fatalf("pairing failed: %v", err)
+		var err error
+		info, err = client.GetInfo()
+		if err != nil {
+			fatalf("get info after reconnect failed: %v", err)
 		}
-		// Save credentials for next time
-		if err := credStore.Save(info.DeviceID, client.PairingID, client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private); err != nil {
+	}
+
+	savePairingCredentials := func() {
+		if client.PairKeys == nil {
+			return
+		}
+		if err := credStore.SavePairing(info.DeviceID, client.PairingID,
+			client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
+			client.PairingProtocol()); err != nil {
 			log.Printf("warning: failed to save credentials: %v", err)
 		} else {
 			log.Printf("credentials saved (%s)", *credBackend)
 		}
-	} else if savedCreds != nil {
+	}
+
+	pairWithCredential := func(value string, expectPIN bool) {
+		if value == "" {
+			value = credentialOrPrompt("", client, info, expectPIN)
+		}
+		credential = value
+		client.SetPassword(credential)
+		if err := client.Pair(ctx, value); err != nil {
+			fatalf("pairing failed: %v", err)
+		}
+		savePairingCredentials()
+	}
+
+	if needFullPair {
+		if forcePairUsesTransient(info) {
+			if err := client.Pair(ctx, ""); err != nil {
+				fatalf("transient pairing failed for password-protected receiver: %v", err)
+			}
+		} else {
+			pairWithCredential(credential, !info.RequiresPassword())
+		}
+	} else if savedCreds != nil && savedCreds.HasPairingCredentials() {
 		// Use saved credentials — pair-verify
 		log.Printf("using saved credentials (%s)", *credBackend)
-		pub, priv := savedCreds.Ed25519Keys()
-		client.PairingID = savedCreds.PairingID
-		client.PairKeys = &airplay.PairKeys{
-			Ed25519Public:  pub,
-			Ed25519Private: priv,
+		verifyErr := client.RestorePairingCredentials(savedCreds)
+		if verifyErr == nil {
+			verifyErr = client.PairVerify(ctx)
 		}
-		if err := client.PairVerify(ctx); err != nil {
-			log.Printf("pair-verify with saved creds failed: %v, falling back to transient pairing", err)
-			// Reconnect — the failed pair-verify may have closed the connection
-			client.Close()
-			if err := client.Connect(ctx); err != nil {
-				log.Fatalf("reconnect failed: %v", err)
-			}
-			if _, err := client.GetInfo(); err != nil {
-				log.Fatalf("get info after reconnect failed: %v", err)
-			}
-			if err := client.Pair(ctx, ""); err != nil {
-				log.Printf("transient pairing fallback failed: %v, prompting for PIN", err)
-				if airplay.IsHTTPStatusCode(err, 403) {
-					log.Printf("%s", airplay.PairingAccessDeniedHint(info))
-				}
-				pinVal := promptForPIN(client, info)
-				// Reconnect for fresh PIN pairing attempt
-				client.Close()
-				client = airplay.NewAirPlayClient(addr, *port)
-				if err := client.Connect(ctx); err != nil {
-					log.Fatalf("reconnect failed: %v", err)
-				}
-				if _, err := client.GetInfo(); err != nil {
-					log.Fatalf("get info after reconnect failed: %v", err)
-				}
-				if err := client.Pair(ctx, pinVal); err != nil {
-					log.Fatalf("PIN pairing failed: %v", err)
-				}
-				// Save credentials for next time
-				if err := credStore.Save(info.DeviceID, client.PairingID, client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private); err != nil {
-					log.Printf("warning: failed to save credentials: %v", err)
-				} else {
-					log.Printf("credentials saved (%s)", *credBackend)
-				}
+		if verifyErr != nil {
+			log.Printf("pair-verify with saved creds failed: %v", verifyErr)
+			reconnect()
+			if passwordRequiresPairing(info) {
+				pairWithCredential("", false)
+			} else if info.RequiredPairingCredential() == airplay.PairingCredentialPIN {
+				pairWithCredential("", true)
+			} else if err := client.Pair(ctx, ""); err != nil {
+				log.Printf("transient pairing fallback failed: %v", err)
+				reconnect()
+				pairWithCredential("", false)
 			}
 		}
 	} else {
-		// Transient pairing (no saved creds, no PIN)
-		if err := client.Pair(ctx, ""); err != nil {
-			log.Printf("transient pairing failed: %v, prompting for PIN", err)
-			if airplay.IsHTTPStatusCode(err, 403) {
-				log.Printf("%s", airplay.PairingAccessDeniedHint(info))
-			}
-			pinVal := promptForPIN(client, info)
-			// Reconnect for fresh PIN pairing attempt
-			client.Close()
-			client = airplay.NewAirPlayClient(addr, *port)
-			if err := client.Connect(ctx); err != nil {
-				log.Fatalf("reconnect failed: %v", err)
-			}
-			if _, err := client.GetInfo(); err != nil {
-				log.Fatalf("get info after reconnect failed: %v", err)
-			}
-			if err := client.Pair(ctx, pinVal); err != nil {
-				log.Fatalf("PIN pairing failed: %v", err)
-			}
-			// Save credentials for next time
-			if err := credStore.Save(info.DeviceID, client.PairingID, client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private); err != nil {
-				log.Printf("warning: failed to save credentials: %v", err)
-			} else {
-				log.Printf("credentials saved (%s)", *credBackend)
-			}
+		if passwordRequiresPairing(info) {
+			pairWithCredential("", false)
+		} else if info.RequiredPairingCredential() == airplay.PairingCredentialPIN {
+			pairWithCredential("", true)
+		} else if err := client.Pair(ctx, ""); err != nil {
+			log.Printf("transient pairing failed: %v", err)
+			reconnect()
+			pairWithCredential("", false)
 		}
 	}
 	log.Println("pairing complete")
@@ -250,7 +282,7 @@ func main() {
 	if client.FpEkey == nil {
 		if err := client.FairPlaySetup(ctx); err != nil {
 			if !errors.Is(err, airplay.ErrFairPlayUnsupported) {
-				log.Fatalf("FairPlay setup failed: %v", err)
+				fatalf("FairPlay setup failed: %v", err)
 			}
 			log.Printf("FairPlay SAP unsupported (%v); continuing with pair-verify DataStream setup", err)
 		} else {
@@ -258,10 +290,6 @@ func main() {
 		}
 	}
 
-	portMin, portMax, err := parsePortRange(*portRange)
-	if err != nil {
-		log.Fatalf("invalid -port-range: %v", err)
-	}
 	streamCfg := airplay.StreamConfig{
 		FPS:       *fps,
 		Bitrate:   *bitrate,
@@ -271,9 +299,22 @@ func main() {
 		PortMin:   portMin,
 		PortMax:   portMax,
 	}
-	session, err := client.SetupMirror(ctx, streamCfg)
+	var captureWidth, captureHeight int
+	prepareVideo := func(width, height int) error {
+		captureWidth, captureHeight = width, height
+		return nil
+	}
+	session, err := client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+	if errors.Is(err, airplay.ErrCredentialsRequired) && credential == "" {
+		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the code shown on the receiver, or its configured password: ")
+		if credential == "" {
+			fatalf("receiver code/password cannot be empty")
+		}
+		client.SetPassword(credential)
+		session, err = client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+	}
 	if err != nil {
-		log.Fatalf("mirror setup failed: %v", err)
+		fatalf("mirror setup failed: %v", err)
 	}
 	defer session.Close()
 	log.Printf("mirror session ready (data port: %d)", session.DataPort)
@@ -287,23 +328,27 @@ func main() {
 		}
 		var err error
 		capture, err = airplay.StartTestCapture(ctx, airplay.CaptureConfig{
-			FPS:     *fps,
-			Bitrate: *bitrate,
-			HWAccel: *hwaccel,
+			FPS:       *fps,
+			Bitrate:   *bitrate,
+			HWAccel:   *hwaccel,
+			MaxWidth:  captureWidth,
+			MaxHeight: captureHeight,
 		})
 		if err != nil {
-			log.Fatalf("test capture failed: %v", err)
+			fatalf("test capture failed: %v", err)
 		}
 	} else {
 		captureCfg := airplay.CaptureConfig{
-			FPS:     *fps,
-			Bitrate: *bitrate,
-			HWAccel: *hwaccel,
+			FPS:       *fps,
+			Bitrate:   *bitrate,
+			HWAccel:   *hwaccel,
+			MaxWidth:  captureWidth,
+			MaxHeight: captureHeight,
 		}
 		var err error
 		capture, err = airplay.StartCapture(ctx, captureCfg)
 		if err != nil {
-			log.Fatalf("screen capture failed: %v", err)
+			fatalf("screen capture failed: %v", err)
 		}
 	}
 	defer capture.Stop()
@@ -316,7 +361,7 @@ func main() {
 
 	// Start audio capture and streaming unless disabled.
 	if !*noAudio && session.HasAudio() {
-		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode)
+		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, session.AudioCodec())
 		if err != nil {
 			log.Printf("warning: audio capture failed: %v (continuing without audio)", err)
 		} else {
@@ -333,26 +378,53 @@ func main() {
 	}
 
 	if err := session.StreamFrames(ctx, capture, 0*time.Second); err != nil && ctx.Err() == nil {
-		log.Fatalf("streaming error: %v", err)
+		fatalf("streaming error: %v", err)
 	}
 	log.Println("stream ended")
 }
 
-func promptForPIN(client *airplay.AirPlayClient, info *airplay.ReceiverInfo) string {
-	if err := client.StartPINDisplay(); err != nil {
-		if airplay.IsHTTPStatusCode(err, 403) {
+func credentialOrPrompt(value string, client *airplay.AirPlayClient, info *airplay.ReceiverInfo, expectPIN bool) string {
+	if value != "" {
+		return value
+	}
+	displayErr := client.StartPINDisplay()
+	if displayErr != nil {
+		if airplay.IsHTTPStatusCode(displayErr, 403) {
 			log.Printf("%s", airplay.PairingAccessDeniedHint(info))
 		}
-		log.Printf("warning: failed to trigger PIN display: %v", err)
+		log.Printf("warning: failed to trigger PIN display: %v", displayErr)
 	}
-	fmt.Print("Enter the PIN shown on Apple TV: ")
-	var pinVal string
-	fmt.Scanln(&pinVal)
-	return pinVal
+	prompt := "Enter the receiver's configured password or pairing PIN: "
+	if expectPIN && displayErr == nil {
+		prompt = "Enter the PIN shown on the receiver: "
+	}
+	credential := readCredential(bufio.NewReader(os.Stdin), prompt)
+	if credential == "" {
+		fatalf("pairing credential cannot be empty")
+	}
+	return credential
+}
+
+func passwordRequiresPairing(info *airplay.ReceiverInfo) bool {
+	return info != nil && info.RequiredPairingCredential() == airplay.PairingCredentialPassword
+}
+
+func forcePairUsesTransient(info *airplay.ReceiverInfo) bool {
+	return info != nil && info.RequiresPassword() &&
+		info.RequiredPairingCredential() == airplay.PairingCredentialNone
+}
+
+func readCredential(reader *bufio.Reader, prompt string) string {
+	fmt.Print(prompt)
+	line, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		fatalf("failed to read credential: %v", err)
+	}
+	return strings.TrimRight(line, "\r\n")
 }
 
 func selectDevice(ctx context.Context) (*airplay.AirPlayDevice, error) {
-	fmt.Println("searching for Apple TVs...")
+	fmt.Println("searching for AirPlay receivers...")
 	discoverCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -398,9 +470,9 @@ func selectDevice(ctx context.Context) (*airplay.AirPlayDevice, error) {
 
 func noDevicesFoundError() error {
 	if runtime.GOOS == "windows" {
-		return fmt.Errorf("no Apple TVs found. On Windows this usually means mDNS/network discovery is blocked or the receiver is on another subnet. Set the active Wi-Fi/Ethernet network profile to Private, enable Network Discovery, make sure the receiver is on the same local network, or bypass discovery with -target <receiver-ip>")
+		return fmt.Errorf("no AirPlay receivers found. On Windows this usually means mDNS/network discovery is blocked or the receiver is on another subnet. Set the active Wi-Fi/Ethernet network profile to Private, enable Network Discovery, make sure the receiver is on the same local network, or bypass discovery with -target <receiver-ip>")
 	}
-	return fmt.Errorf("no Apple TVs found")
+	return fmt.Errorf("no AirPlay receivers found")
 }
 
 func appleTVModelGeneration(model string) int {
@@ -444,13 +516,15 @@ func compareIPs(a, b string) int {
 	return 0
 }
 
-func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwaccel string, debug, testMode, noEncrypt, directKey, noAudio bool) {
+func runDaemon(socketPath, credFile, credBackend string, fps, bitrate, portMin, portMax int, hwaccel string, debug, testMode, noEncrypt, directKey, noAudio bool) {
 	cfg := daemon.Config{
 		SocketPath:  socketPath,
 		CredFile:    credFile,
 		CredBackend: credBackend,
 		FPS:         fps,
 		Bitrate:     bitrate,
+		PortMin:     portMin,
+		PortMax:     portMax,
 		HWAccel:     hwaccel,
 		Debug:       debug,
 		TestMode:    testMode,
@@ -461,7 +535,7 @@ func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwacc
 
 	d, err := daemon.New(cfg)
 	if err != nil {
-		log.Fatalf("[daemon] %v", err)
+		fatalf("[daemon] %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -476,11 +550,11 @@ func runDaemon(socketPath, credFile, credBackend string, fps, bitrate int, hwacc
 		d.Shutdown()
 		<-sigCh
 		log.Println("[daemon] forced exit")
-		os.Exit(1)
+		exitProgram(1)
 	}()
 
 	if err := d.Run(ctx); err != nil {
-		log.Fatalf("[daemon] %v", err)
+		fatalf("[daemon] %v", err)
 	}
 }
 

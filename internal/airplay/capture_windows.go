@@ -18,9 +18,11 @@ import (
 
 // CaptureConfig holds screen capture settings.
 type CaptureConfig struct {
-	FPS     int
-	Bitrate int    // Video bitrate in kbps (0 = auto)
-	HWAccel string // "auto", "nvenc", "none"
+	FPS       int
+	Bitrate   int    // Video bitrate in kbps (0 = auto)
+	HWAccel   string // "auto", "nvenc", "none"
+	MaxWidth  int    // receiver-advertised encoded canvas; zero keeps native size
+	MaxHeight int
 
 	RestoreToken     string
 	SaveRestoreToken func(string) error
@@ -47,13 +49,14 @@ type ScreenCapture struct {
 
 // StartCapture starts Windows desktop capture through FFmpeg.
 func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		return nil, fmt.Errorf("ffmpeg not found on PATH; install FFmpeg and retry")
+	ffmpegPath, err := ffmpegExecutable()
+	if err != nil {
+		return nil, err
 	}
-	return startFFmpegCapture(ctx, cfg)
+	return startFFmpegCapture(ctx, cfg, ffmpegPath)
 }
 
-func startFFmpegCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
+func startFFmpegCapture(ctx context.Context, cfg CaptureConfig, ffmpegPath string) (*ScreenCapture, error) {
 	fps := cfg.FPS
 	if fps <= 0 {
 		fps = 30
@@ -70,6 +73,9 @@ func startFFmpegCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture,
 		"-i", "desktop",
 		"-an",
 	}
+	if scale := ffmpegReceiverScaleFilter(cfg); scale != "" {
+		ffArgs = append(ffArgs, "-vf", scale)
+	}
 	ffArgs = append(ffArgs, ffmpegEncoder(cfg)...)
 	ffArgs = append(ffArgs,
 		"-pix_fmt", "yuv420p",
@@ -84,7 +90,7 @@ func startFFmpegCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture,
 		"-f", "h264",
 		"pipe:1",
 	)
-	return startFFmpegProcess(ctx, "ffmpeg", ffArgs, "FFMPEG")
+	return startFFmpegProcess(ctx, ffmpegPath, ffArgs, "FFMPEG")
 }
 
 func ffmpegEncoder(cfg CaptureConfig) []string {
@@ -150,8 +156,9 @@ func (sc *ScreenCapture) Stop() {
 
 // StartTestCapture creates a synthetic H.264 video stream through FFmpeg.
 func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		return nil, fmt.Errorf("ffmpeg not found on PATH; install FFmpeg and retry")
+	ffmpegPath, err := ffmpegExecutable()
+	if err != nil {
+		return nil, err
 	}
 
 	fps := cfg.FPS
@@ -167,6 +174,11 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 		"-f", "lavfi",
 		"-i", fmt.Sprintf("testsrc2=size=%dx%d:rate=%d", testCaptureWidth, testCaptureHeight, fps),
 		"-an",
+	}
+	if scale := ffmpegReceiverScaleFilter(cfg); scale != "" {
+		ffArgs = append(ffArgs, "-vf", scale)
+	}
+	ffArgs = append(ffArgs,
 		"-c:v", "libx264",
 		"-preset", "ultrafast",
 		"-tune", "zerolatency",
@@ -179,8 +191,8 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 		"-bf", "0",
 		"-f", "h264",
 		"pipe:1",
-	}
-	return startFFmpegProcess(ctx, "ffmpeg", ffArgs, "FFMPEG")
+	)
+	return startFFmpegProcess(ctx, ffmpegPath, ffArgs, "FFMPEG")
 }
 
 func startFFmpegProcess(ctx context.Context, name string, args []string, logPrefix string) (*ScreenCapture, error) {
@@ -241,6 +253,9 @@ func captureBitrateKbps(cfg CaptureConfig) int {
 		fps = 30
 	}
 	width, height := 1920, 1080
+	if maxWidth, maxHeight := receiverCaptureSize(cfg); maxWidth > 0 && maxWidth*maxHeight < width*height {
+		width, height = maxWidth, maxHeight
+	}
 	bitrate := recommendedBitrateKbps(width, height, fps)
 	log.Printf("[CAPTURE] auto bitrate selected: %d kbps for %dx%d@%dfps", bitrate, width, height, fps)
 	return bitrate

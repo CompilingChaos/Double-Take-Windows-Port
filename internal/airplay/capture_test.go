@@ -85,3 +85,17 @@ func TestVbvBufferKbit(t *testing.T) {
 		})
 	}
 }
+
+func TestFFmpegReceiverScaleFilter(t *testing.T) {
+	cfg := CaptureConfig{MaxWidth: 1921, MaxHeight: 1081}
+	if width, height := receiverCaptureSize(cfg); width != 1920 || height != 1080 {
+		t.Fatalf("receiverCaptureSize() = %dx%d, want 1920x1080", width, height)
+	}
+	want := "scale=w=1920:h=1080:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+	if got := ffmpegReceiverScaleFilter(cfg); got != want {
+		t.Fatalf("ffmpegReceiverScaleFilter() = %q, want %q", got, want)
+	}
+	if got := ffmpegReceiverScaleFilter(CaptureConfig{}); got != "" {
+		t.Fatalf("empty ffmpegReceiverScaleFilter() = %q, want empty", got)
+	}
+}

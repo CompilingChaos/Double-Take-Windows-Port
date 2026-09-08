@@ -10,15 +10,20 @@ import (
 )
 
 // StartAudioCapture launches a pipeline that captures system audio and feeds
-// raw PCM into the built-in ALAC encoder.
-func StartAudioCapture(ctx context.Context, testTone bool) (*AudioCapture, error) {
+// raw PCM into the encoder negotiated with the receiver.
+func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*AudioCapture, error) {
 	captureCtx, cancel := context.WithCancel(ctx)
+	if codec != AudioCodecALAC && codec != AudioCodecAACELD {
+		cancel()
+		return nil, fmt.Errorf("unsupported audio codec %d", codec)
+	}
+	_, codecSPF, _, _, _, _ := codec.Info()
 
 	var srcArgs []string
 	if testTone {
 		srcArgs = []string{"audiotestsrc", "wave=sine", "freq=440", "is-live=true",
-			"samplesperbuffer=352"}
-		dbg("[AUDIO] using test tone (440 Hz sine wave, live, spf=352)")
+			fmt.Sprintf("samplesperbuffer=%d", codecSPF)}
+		dbg("[AUDIO] using test tone (440 Hz sine wave, live, spf=%d)", codecSPF)
 	} else if exec.Command("gst-inspect-1.0", "pulsesrc").Run() == nil {
 		monitor := detectPulseMonitor()
 		if monitor == "" {
@@ -38,6 +43,15 @@ func StartAudioCapture(ctx context.Context, testTone bool) (*AudioCapture, error
 	ac := &AudioCapture{
 		cancel: cancel,
 		waitCh: make(chan struct{}),
+		codec:  codec,
+	}
+	if codec == AudioCodecAACELD {
+		var err error
+		ac.eld, err = newELDEncoder()
+		if err != nil {
+			cancel()
+			return nil, err
+		}
 	}
 
 	gstArgs := []string{"--quiet"}
@@ -49,7 +63,7 @@ func StartAudioCapture(ctx context.Context, testTone bool) (*AudioCapture, error
 		"!", "queue", "max-size-buffers=2", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
 		"!", "fdsink", "fd=1", "sync=false", "async=false",
 	)
-	dbg("[AUDIO] ALAC verbatim pipeline: gst-launch-1.0 %s", strings.Join(gstArgs, " "))
+	dbg("[AUDIO] PCM capture pipeline: gst-launch-1.0 %s", strings.Join(gstArgs, " "))
 
 	gstCmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
 	gstStdout, err := gstCmd.StdoutPipe()
@@ -60,13 +74,16 @@ func StartAudioCapture(ctx context.Context, testTone bool) (*AudioCapture, error
 	gstStderr, _ := gstCmd.StderrPipe()
 
 	if err := gstCmd.Start(); err != nil {
+		if ac.eld != nil {
+			ac.eld.Close()
+			ac.eld = nil
+		}
 		cancel()
-		return nil, fmt.Errorf("start ALAC gst pipeline: %w", err)
+		return nil, fmt.Errorf("start audio capture pipeline: %w", err)
 	}
 	go logStderr("AUDIO-GST", gstStderr)
 
-	ac.cmd = gstCmd
-	ac.killFn = func() {
+	ac.stopFn = func() {
 		if gstCmd.Process != nil {
 			_ = gstCmd.Process.Kill()
 		}

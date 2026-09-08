@@ -1,18 +1,18 @@
 # doubletake
 
-AirPlay screen mirroring sender for Windows and Linux. Streams your desktop to an Apple TV using the AirPlay 2 mirroring protocol.
+AirPlay screen mirroring sender for Windows and Linux. Streams your desktop to Apple TV, Mac, and compatible third-party AirPlay receivers.
 
 ## Features
 
 - Full AirPlay 2 mirroring protocol (RTSP/HTTP + encrypted video stream)
 - FairPlay SAP authentication (snapshot-backed Go ARM64 execution)
-- SRP-6a pairing with PIN and persistent credential storage
+- Legacy and modern AirPlay pairing, password authentication, and persistent credential storage
 - Windows desktop capture (Direct3D/GDI), Wayland (PipeWire/xdg-desktop-portal), and X11 screen capture
 - Hardware-accelerated H.264 encoding (Windows D3D11/NVENC, Linux NVENC/VA-API) with software fallback
 - Windows WASAPI and Linux PulseAudio/PipeWire audio capture
 - ChaCha20-Poly1305 stream encryption
-- mDNS device discovery
-	- Daemon mode with multi-target streaming control (`doubletake-ctl`)
+- mDNS device discovery for Apple TV, Mac, and compatible receivers
+- Daemon mode with multi-target streaming control (`doubletake-ctl`)
 - Configurable latency target (`-target-latency-ms`, default 100ms)
 - KDE Plasma widget for Linux quick access (see [plasmoid/](plasmoid/))
 
@@ -25,7 +25,7 @@ AirPlay screen mirroring sender for Windows and Linux. Streams your desktop to a
 ### Windows
 
 1. Install Go from <https://go.dev/dl/>.
-2. Install FFmpeg and make sure `ffmpeg.exe` is on `PATH`.
+2. Put `ffmpeg.exe` in the same folder as `doubletake.exe`, or install FFmpeg and make sure it is on `PATH`. A copy beside `doubletake.exe` is used first.
 
 ```powershell
 winget install --id Gyan.FFmpeg --exact
@@ -108,7 +108,7 @@ sudo make uninstall
 
 ## Firewall
 
-doubletake opens UDP ports (audio timing/control/data - 3 consecutive) and one TCP port (event channel) and advertises them to the Apple TV during SETUP. The Apple TV connects back to those ports. Until that reverse handshake completes, the receiver silently stalls and SETUP never returns.
+doubletake opens UDP ports (audio timing/control/data - 3 consecutive) and one TCP port (event channel) and advertises them to the AirPlay receiver during SETUP. The receiver connects back to those ports. Until that reverse handshake completes, the receiver may silently stall and SETUP never returns.
 
 By default the OS assigns ephemeral ports. Use `-port-range MIN-MAX` to confine them to a small window you can open in your firewall (needs at least 4 ports):
 
@@ -125,11 +125,17 @@ sudo ufw allow from any proto udp to any port 60000:60010
 sudo ufw allow from any proto tcp to any port 60000:60010
 ```
 
-For nftables/firewalld, add equivalent rules allowing inbound UDP and TCP from the Apple TV's address on the chosen range.
+For nftables/firewalld, add equivalent rules allowing inbound UDP and TCP from the receiver's address on the chosen range.
+
+## Mac Receiver Setup
+
+On the destination Mac, open **System Settings > General > AirDrop & Handoff** (called **AirDrop & Continuity** on some macOS versions), turn on **AirPlay Receiver**, and allow users on the same network. If **Require Password** is enabled, pass it with `-code`, set `DOUBLETAKE_CODE`, or enter it when prompted.
+
+The sender and Mac should be on the same local network. Discovery accepts Macs only when they advertise AirPlay screen-mirroring support, so unrelated AirPlay audio devices are not listed. Windows currently captures ALAC audio; a receiver that offers only AAC-ELD will receive video without audio.
 
 ## Discovery Troubleshooting
 
-If Windows prints `discovery failed: no Apple TVs found`, discovery is failing before pairing or streaming starts. Check that the active Wi-Fi/Ethernet network is set to a Private network profile, Windows Network Discovery is enabled, and the AirPlay receiver is on the same local subnet as this PC. Guest Wi-Fi, hotel Wi-Fi, university networks, VPNs, and client-isolation settings often block mDNS discovery.
+If Windows prints `discovery failed: no AirPlay receivers found`, discovery is failing before pairing or streaming starts. Check that the active Wi-Fi/Ethernet network is set to a Private network profile, Windows Network Discovery is enabled, and the AirPlay receiver is on the same local subnet as this PC. Guest Wi-Fi, hotel Wi-Fi, university networks, VPNs, and client-isolation settings often block mDNS discovery.
 
 If you know the receiver's IP address, bypass discovery:
 
@@ -140,13 +146,13 @@ If you know the receiver's IP address, bypass discovery:
 ## Usage
 
 ```sh
-# Discover Apple TVs on the network and stream
+# Discover AirPlay receivers on the network and stream
 doubletake
 
 # Disable audio for video-only mirroring
 doubletake -no-audio
 
-# Connect to a specific Apple TV
+# Connect to a specific receiver
 doubletake -target 192.168.1.77
 
 # First-time pairing with PIN (saves credentials for reuse)
@@ -184,9 +190,10 @@ doubletake-ctl disconnect
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-target` | | Apple TV IP (skip mDNS discovery) |
+| `-target` | | AirPlay receiver IP or hostname (skip mDNS discovery) |
 | `-port` | 7000 | AirPlay port |
-| `-pin` | | 4-digit PIN for pairing |
+| `-code` | | Pairing code or receiver password |
+| `-pin` | | Backward-compatible alias for `-code` |
 | `-cred-backend` | `file` | Credential backend (`file` or `keyring`) |
 | `-creds` | OS default | Credentials file path (`%APPDATA%\doubletake\credentials.json` on Windows, `~/.config/doubletake/credentials.json` on Linux) |
 | `-pair` | false | Force new pairing |
@@ -200,7 +207,7 @@ doubletake-ctl disconnect
 | `-test` | false | Use synthetic video source |
 | `-daemonize` | false | Run as background daemon with local control interface |
 | `-socket` | OS default | Daemon control endpoint (`127.0.0.1:53531` on Windows, `$XDG_RUNTIME_DIR/doubletake.sock` on Linux) |
-	| `-debug` | false | Verbose debug logging |
+| `-debug` | false | Verbose debug logging |
 
 ### Daemon Control (`doubletake-ctl`)
 

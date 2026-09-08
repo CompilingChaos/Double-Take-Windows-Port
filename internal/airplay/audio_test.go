@@ -8,10 +8,10 @@ import (
 )
 
 func TestUseAudioFECDefaults(t *testing.T) {
-	if !useAudioFEC(false) {
+	if !useAudioFEC(AudioCodecALAC, false) {
 		t.Fatal("expected legacy/plaintext sessions to keep FEC by default")
 	}
-	if useAudioFEC(true) {
+	if useAudioFEC(AudioCodecALAC, true) {
 		t.Fatal("expected modern encrypted sessions to disable FEC by default")
 	}
 }

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,7 +24,8 @@ type audioChaChaNonceMode int
 type audioChaChaAADMode int
 
 const (
-	AudioCodecALAC AudioCodec = 2 // ct=2, spf=352, audioFormat=0x40000
+	AudioCodecALAC   AudioCodec = 2 // ct=2, spf=352, audioFormat=0x40000
+	AudioCodecAACELD AudioCodec = 8 // ct=8, spf=480, audioFormat=0x1000000
 
 	audioSecurityLegacyAES audioSecurityMode = iota
 	audioSecurityChaCha
@@ -37,14 +40,21 @@ const (
 	audioChaChaAADTimestampSSRC
 
 	audioChaChaNonceSize = 8
+
+	audioSyncPayloadTypeNTP = 0xd4
+	audioSyncPayloadTypePTP = 0xd7
 )
+
+// ErrAACELDUnavailable means this build does not contain the optional FDK-AAC
+// encoder. Video remains usable on receivers which require AAC-ELD audio.
+var ErrAACELDUnavailable = errors.New("AAC-ELD encoder is unavailable")
 
 func newAudioChaCha64AEAD(key []byte) (cipher.AEAD, error) {
 	return aeadchacha20poly1305.NewCipher(key)
 }
 
-func useAudioFEC(modernEncrypted bool) bool {
-	return !modernEncrypted
+func useAudioFEC(codec AudioCodec, chachaEncrypted bool) bool {
+	return codec == AudioCodecALAC && !chachaEncrypted
 }
 
 func defaultAudioChaChaNonceMode() audioChaChaNonceMode {
@@ -55,15 +65,21 @@ func defaultAudioChaChaAADMode() audioChaChaAADMode {
 	return audioChaChaAADTimestampSSRC
 }
 
+// AudioFormatIndex is kept for the legacy Apple TV descriptor path.
 func (c AudioCodec) AudioFormatIndex() int64 {
-	return 0x12
+	if c == AudioCodecALAC {
+		return 0x12
+	}
+	return 0
 }
 
-// AudioCodecInfo returns SETUP parameters for the supported mirrored-audio codec.
+// Info returns SETUP parameters for the supported mirrored-audio codec.
 func (c AudioCodec) Info() (ct int64, spf int64, audioFormat int64, latencyMin int64, latencyMax int64, latencySamples uint32) {
 	latency := targetLatencySamples44k1()
-	latencyI64 := int64(latency)
-	return 2, 352, 0x40000, latencyI64, latencyI64, latency
+	if c == AudioCodecAACELD {
+		return int64(AudioCodecAACELD), 480, 0x1000000, 0, int64(latency), latency
+	}
+	return 2, 352, 0x40000, 0, int64(latency), latency
 }
 
 func audioLatencySamplesForCodec(ct byte, override uint32) uint32 {
@@ -74,19 +90,28 @@ func audioLatencySamplesForCodec(ct byte, override uint32) uint32 {
 	return targetLatencySamples44k1()
 }
 
-// AudioCapture manages PCM audio capture and local ALAC encoding.
+func randomRTPTime(reader io.Reader) (uint32, error) {
+	var value [4]byte
+	if _, err := io.ReadFull(reader, value[:]); err != nil {
+		return 0, fmt.Errorf("generate RTP timestamp: %w", err)
+	}
+	return binary.BigEndian.Uint32(value[:]), nil
+}
+
+// AudioCapture manages platform audio capture and local encoding.
 type AudioCapture struct {
-	cmd     interface{ Wait() error }
-	killFn  func()
 	pcmPipe io.ReadCloser
 	cancel  context.CancelFunc
 	stopFn  func()
 	waitCh  chan struct{}
 	waitErr error
 	stopped bool
+	codec   AudioCodec
+	eldMu   sync.Mutex
+	eld     *eldEncoder
 }
 
-// ReadFrame reads a single ALAC-encoded audio frame.
+// ReadFrame reads one encoded audio frame.
 func (ac *AudioCapture) ReadFrame(buf []byte) (int, error) {
 	select {
 	case <-ac.waitCh:
@@ -97,13 +122,22 @@ func (ac *AudioCapture) ReadFrame(buf []byte) (int, error) {
 	default:
 	}
 
-	const spf = 352
+	_, codecSPF, _, _, _, _ := ac.codec.Info()
+	spf := int(codecSPF)
 	const channels = 2
 	const bytesPerSample = 2
 	pcmSize := spf * channels * bytesPerSample // 1408 bytes
 	pcm := make([]byte, pcmSize)
 	if _, err := io.ReadFull(ac.pcmPipe, pcm); err != nil {
 		return 0, err
+	}
+	if ac.codec == AudioCodecAACELD {
+		ac.eldMu.Lock()
+		defer ac.eldMu.Unlock()
+		if ac.eld == nil {
+			return 0, io.EOF
+		}
+		return ac.eld.Encode(pcm, buf)
 	}
 	n := encodeALACVerbatim(buf, pcm, spf, channels, 16)
 	return n, nil
@@ -164,17 +198,20 @@ func (ac *AudioCapture) Stop() {
 	if ac.pcmPipe != nil {
 		ac.pcmPipe.Close()
 	}
-	if ac.killFn != nil {
-		ac.killFn()
-	}
 	select {
 	case <-ac.waitCh:
 	case <-time.After(2 * time.Second):
-		if ac.killFn != nil {
-			ac.killFn()
+		if ac.stopFn != nil {
+			ac.stopFn()
 		}
 		<-ac.waitCh
 	}
+	ac.eldMu.Lock()
+	if ac.eld != nil {
+		ac.eld.Close()
+		ac.eld = nil
+	}
+	ac.eldMu.Unlock()
 }
 
 // encodeALACVerbatim produces a verbatim (uncompressed) ALAC frame from
@@ -293,19 +330,24 @@ type AudioStream struct {
 	chachaNonce     uint64
 	chachaNonceMode audioChaChaNonceMode
 	chachaAADMode   audioChaChaAADMode
-	ct              byte   // compression type: 2=ALAC
+	ct              byte   // AirPlay compression type (2=ALAC, 8=AAC-ELD)
 	spf             uint16 // samples per frame
 	latencySamples  uint32 // audio latency in samples (for sync packets)
 	mu              sync.Mutex
 }
 
+// AudioCodec returns the codec negotiated for this mirror session.
+func (s *MirrorSession) AudioCodec() AudioCodec {
+	if s == nil || s.audioStream == nil {
+		return AudioCodecALAC
+	}
+	return AudioCodec(s.audioStream.ct)
+}
+
 // setupAudioStream creates the audio RTP stream state.
-// Real AirPlay senders use TWO separate UDP sockets for audio:
+// Real AirPlay senders use two separate UDP sockets for audio:
 //   - ctrlConn: the declared controlPort socket → sends sync/control to receiver's controlPort
 //   - dataConn: a separate socket at controlPort+1 → sends audio data to receiver's dataPort
-//
-// Both pcaps show senders allocate 3 consecutive ports: timing(N), control(N+1), data(N+2).
-// The Apple TV classifies incoming traffic by source port.
 func (s *MirrorSession) setupAudioStream(dataPort, controlPort int, aesKey, aesIV, chachaKey []byte, securityMode audioSecurityMode, ct byte, latencyOverride uint32, ctrlConn, dataConn net.PacketConn) (*AudioStream, error) {
 	remoteAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(s.client.host, fmt.Sprintf("%d", dataPort)))
 	if err != nil {
@@ -338,7 +380,8 @@ func (s *MirrorSession) setupAudioStream(dataPort, controlPort int, aesKey, aesI
 		}
 	}
 
-	spf := uint16(352)
+	_, codecSPF, _, _, _, _ := AudioCodec(ct).Info()
+	spf := uint16(codecSPF)
 	latencySamples := audioLatencySamplesForCodec(ct, latencyOverride)
 
 	// Apple senders use SSRC=0 for mirroring audio RTP.
@@ -437,11 +480,10 @@ func (as *AudioStream) audioChaChaAAD(header []byte, rtpTime uint32) []byte {
 	case audioChaChaAADRTPHeader:
 		return header
 	case audioChaChaAADTimestampSSRC:
-		// The receiver reconstructs the AAD from the RTP timestamp and SSRC bytes
-		// in network order, so use the on-wire header bytes directly.
-		aad := make([]byte, 8)
-		copy(aad, header[4:12])
-		return aad
+		// APSTransportMessageGetAudioAADPointer returns the serialized timestamp
+		// and SSRC fields directly: eight bytes beginning two bytes into Apple's
+		// ten-byte audio-data header (the RTP header without V/PT).
+		return header[4:12]
 	default:
 		return nil
 	}
@@ -523,8 +565,9 @@ func (as *AudioStream) sendAudioPacketWithSeqAndNonce(payload []byte, rtpTime ui
 		return usedNonce, err
 	}
 
-	// Track the latest RTP time for sync packets (only update forward)
-	if rtpTime >= as.rtpTime {
+	// RTP timestamps wrap at 32 bits. A signed modular comparison keeps an old
+	// retransmit from moving the clock backwards while still crossing rollover.
+	if int32(rtpTime-as.rtpTime) >= 0 {
 		as.rtpTime = rtpTime
 	}
 	return usedNonce, nil
@@ -549,48 +592,65 @@ func aesEncryptAudioPayload(block cipher.Block, iv, data []byte) []byte {
 	return out
 }
 
-// sendSyncPacket sends an RTP sync/timing packet on the control port.
-// This tells the receiver the current RTP timestamp mapping.
-func (as *AudioStream) sendSyncPacket(ntpTime uint64, isFirst bool) error {
+// sendSyncPacket sends the current RTP-to-network-clock mapping on the control
+// port. PTP and NTP sessions use different packet formats.
+func (as *AudioStream) sendSyncPacket(timingProtocol string, networkTime, timelineID uint64, isFirst bool) error {
 	as.mu.Lock()
 	rtpNow := as.rtpTime
 	latencySamples := as.latencySamples
 	as.mu.Unlock()
 
-	// anchorLatency is the playout lead time reported to the receiver: the newest
-	// audio we have sent (rtpNow) plays anchorLatency/44100 seconds after "now".
-	// This equals the negotiated session latency, the same forward bias video
-	// frames carry, so audio and video captured at the same instant play together.
-	anchorLatency := latencySamples
-
-	// Sync packet: 20 bytes total (8-byte RTP-like header + 12-byte payload)
-	// Format observed from real Apple senders:
-	//   header: V=2, X=1(first)/0(subsequent), M=1, PT=84, seq=4 (constant)
-	//   RTP timestamp = current playback position (sync_rtp)
-	//   payload: NTP_hi(4) + NTP_lo(4) + next_rtp(4)
-	//   next_rtp = current receive head (rtpNow)
-	packet := make([]byte, 20)
+	packetSize := 0
+	switch timingProtocol {
+	case timingProtocolNTP:
+		packetSize = 20
+	case timingProtocolPTP:
+		if timelineID == 0 {
+			return fmt.Errorf("PTP TimeAnnounce requires a receiver timeline ID")
+		}
+		packetSize = 28
+	default:
+		return fmt.Errorf("unsupported audio timing protocol %q", timingProtocol)
+	}
+	packet := make([]byte, packetSize)
 	if isFirst {
 		packet[0] = 0x90 // V=2, X=1
 	} else {
 		packet[0] = 0x80 // V=2, X=0
 	}
-	packet[1] = 0xd4 // M=1, PT=84
 	// seq field is constant 4 in working pcap captures
 	binary.BigEndian.PutUint16(packet[2:4], 4)
-	// Bytes 4-7: sync_rtp = current playback position = receive head - anchorLatency
-	syncRtp := rtpNow
-	if rtpNow >= anchorLatency {
-		syncRtp = rtpNow - anchorLatency
-	}
-	binary.BigEndian.PutUint32(packet[4:8], syncRtp)
-	// Bytes 8-15: NTP timestamp (current wall-clock time)
-	binary.BigEndian.PutUint64(packet[8:16], ntpTime)
-	// Bytes 16-19: next_rtp = current receive head
-	binary.BigEndian.PutUint32(packet[16:20], rtpNow)
 
+	if timingProtocol == timingProtocolPTP {
+		// PTP TimeAnnounce: the first RTP value is the media position at the
+		// announced network time; the second is the future RTP position at which
+		// the receiver applies the mapping. Apple senders keep those positions one
+		// negotiated audio latency apart.
+		packet[1] = audioSyncPayloadTypePTP
+		syncRTP := rtpNow - latencySamples
+		binary.BigEndian.PutUint32(packet[4:8], syncRTP)
+		binary.BigEndian.PutUint64(packet[8:16], ptpNanoseconds(networkTime))
+		binary.BigEndian.PutUint32(packet[16:20], rtpNow)
+		binary.BigEndian.PutUint64(packet[20:28], timelineID)
+	} else {
+		// Legacy NTP TimeAnnounce: playback RTP, NTP seconds.32, receive RTP.
+		packet[1] = audioSyncPayloadTypeNTP
+		syncRtp := rtpNow - latencySamples
+		binary.BigEndian.PutUint32(packet[4:8], syncRtp)
+		binary.BigEndian.PutUint64(packet[8:16], networkTime)
+		binary.BigEndian.PutUint32(packet[16:20], rtpNow)
+	}
+
+	dbg("[AUDIO-SYNC] first=%t rtp=%d latency=%d network=0x%016x timeline=0x%016x",
+		isFirst, rtpNow, latencySamples, networkTime, timelineID)
 	_, err := as.ctrlConn.WriteTo(packet, as.ctrlAddr)
 	return err
+}
+
+func ptpNanoseconds(timestamp uint64) uint64 {
+	seconds := timestamp >> 32
+	fraction := timestamp & 0xffffffff
+	return seconds*uint64(time.Second) + (fraction * uint64(time.Second) >> 32)
 }
 
 func (as *AudioStream) Close() {
@@ -602,72 +662,103 @@ func (as *AudioStream) Close() {
 	}
 }
 
-// StreamAudio reads ALAC frames from the capture pipeline and sends
+// StreamAudio reads encoded frames from the capture pipeline and sends
 // RTP audio packets to the receiver. It also sends periodic sync packets.
 func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, audioStream *AudioStream) error {
+	ctx, cancel := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	defer func() {
+		// The periodic announce and RTCP reader are owned by this call. Closing the
+		// sockets unblocks ReadFrom; cancellation stops the ticker before returning.
+		cancel()
+		audioStream.Close()
+		workers.Wait()
+	}()
+
 	spf := uint32(audioStream.spf)
 
-	// Wait for the first video frame before starting audio.
-	// The Apple TV processes audio in the context of an active video stream;
-	// sending audio before video may cause it to be discarded.
-	dbg("[AUDIO] waiting for first video frame before starting audio...")
-	select {
-	case <-s.firstFrameSent:
-		dbg("[AUDIO] first video frame sent, starting audio")
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	// Send initial sync burst — real Apple senders send multiple identical sync
-	// packets (observed 7 in pcap) before any audio data, all with X=1 (0x90).
-	ntpNow := ntpBootTimestamp()
-	for i := 0; i < 7; i++ {
-		if err := audioStream.sendSyncPacket(ntpNow, true); err != nil {
-			dbg("[AUDIO] initial sync error: %v", err)
+	// Prewarm the capture while waiting for the first presentable video frame.
+	// GStreamer starts producing PCM immediately; continuously consuming and
+	// discarding complete frames prevents its internal queues and the stdout pipe
+	// from preserving old samples throughout video encoder startup or the wait
+	// for the next IDR. No audio clock mapping is published during this pre-roll.
+	dbg("[AUDIO] prewarming capture while waiting for first video frame...")
+	prewarmBuf := make([]byte, 8192)
+	prewarmedFrames := 0
+	for {
+		select {
+		case <-s.firstFrameSent:
+			dbg("[AUDIO] first video frame sent after discarding %d pre-roll audio frames", prewarmedFrames)
+			goto videoReady
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
+
+		if _, err := capture.ReadFrame(prewarmBuf); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("audio prewarm: %w", err)
+		}
+		prewarmedFrames++
 	}
 
-	// Start data RTP time at latencySamples so the first real audio packet
-	// has rtp >= next_rtp from the sync packet.
-	// No empty header packet — real Apple senders go directly to data.
-	latencySamples := audioStream.latencySamples
-	nextRtp := latencySamples
-	// Update rtpTime so sync packets reflect the correct position
+videoReady:
+
+	// Apple starts each audio timeline at a random 32-bit RTP epoch. The
+	// latency-adjusted TimeAnnounce value is allowed to wrap below that epoch.
+	// No empty header packet is sent before the first real audio frame.
+	nextRtp, err := randomRTPTime(rand.Reader)
+	if err != nil {
+		return err
+	}
+	// Update rtpTime so the first sync packet reflects the first media position.
 	audioStream.mu.Lock()
 	audioStream.rtpTime = nextRtp
 	audioStream.mu.Unlock()
-	dbg("[AUDIO] sent initial sync burst (7 packets), starting audio at rtp=%d", nextRtp)
 
-	// Periodic sync sender — more frequent during initial ramp-up (every 200ms
-	// for the first 5 seconds), then every 1 second. Real Apple senders appear
-	// to sync roughly every 170ms initially.
+	// Discard any partial pipe backlog between the final prewarm read and the
+	// video-ready signal, then wait until one complete, fresh audio frame is in hand.
+	// The RTP/network-clock mapping must be established at this point, not when
+	// the capture process was merely started: GStreamer and the sound server can
+	// take hundreds of milliseconds to deliver their first sample, which would
+	// otherwise make audio lead video by the same amount.
+	capture.DrainStale()
+	frameBuf := make([]byte, 8192)
+	firstFrameSize := 0
+	for firstFrameSize == 0 {
+		firstFrameSize, err = capture.ReadFrame(frameBuf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("audio read first frame: %w", err)
+		}
+	}
+
+	// Establish the initial clock mapping immediately before the first media
+	// packet. The reset bit is set only on this announce; subsequent 1 Hz
+	// announces update the same mapping.
+	clockNow, timelineID := s.audioClockNow()
+	if err := audioStream.sendSyncPacket(s.timingProtocol, clockNow, timelineID, true); err != nil {
+		return fmt.Errorf("audio initial clock mapping: %w", err)
+	}
+	dbg("[AUDIO] sent initial clock mapping with first frame ready, starting audio at rtp=%d", nextRtp)
+
+	// Apple senders refresh TimeAnnounce once per second.
+	workers.Add(1)
 	go func() {
-		fastTicker := time.NewTicker(200 * time.Millisecond)
-		defer fastTicker.Stop()
-		slowTimer := time.After(5 * time.Second)
+		defer workers.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-slowTimer:
-				// Switch to slow (1s) sync after initial period
-				fastTicker.Stop()
-				slowTick := time.NewTicker(1 * time.Second)
-				defer slowTick.Stop()
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case <-slowTick.C:
-						nt := ntpBootTimestamp()
-						if err := audioStream.sendSyncPacket(nt, false); err != nil {
-							dbg("[AUDIO] sync error: %v", err)
-						}
-					}
-				}
-			case <-fastTicker.C:
-				nt := ntpBootTimestamp()
-				if err := audioStream.sendSyncPacket(nt, false); err != nil {
+			case <-ticker.C:
+				clockNow, timelineID := s.audioClockNow()
+				if err := audioStream.sendSyncPacket(s.timingProtocol, clockNow, timelineID, false); err != nil {
 					dbg("[AUDIO] sync error: %v", err)
 				}
 			}
@@ -675,7 +766,9 @@ func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, 
 	}()
 
 	// Listen for control packets (resend requests) in background
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		buf := make([]byte, 1024)
 		for {
 			n, addr, err := audioStream.ctrlConn.ReadFrom(buf)
@@ -692,7 +785,7 @@ func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, 
 
 	// Redundant audio is kept for legacy/plaintext sessions, but modern
 	// ChaCha-encrypted receivers decode more reliably when each frame is sent once.
-	useFEC := useAudioFEC(audioStream.chachaCipher != nil)
+	useFEC := useAudioFEC(AudioCodec(audioStream.ct), audioStream.chachaCipher != nil)
 	if !useFEC {
 		dbg("[AUDIO] FEC disabled for ChaCha-encrypted sessions: each frame sent once")
 	} else {
@@ -711,12 +804,7 @@ func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, 
 	var frameCount int
 	retransmitIdx := 0
 	burstDone := false
-	frameBuf := make([]byte, 8192)
-
-	// Capture started before video did, so the OS pipe holds a backlog of stale
-	// audio accumulated while we waited for the first video frame. Drop it so we
-	// begin streaming from the freshest sample and audio lines up with video.
-	capture.DrainStale()
+	useFirstFrame := true
 
 	for {
 		select {
@@ -725,12 +813,17 @@ func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, 
 		default:
 		}
 
-		n, err := capture.ReadFrame(frameBuf)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
+		n := firstFrameSize
+		if useFirstFrame {
+			useFirstFrame = false
+		} else {
+			n, err = capture.ReadFrame(frameBuf)
+			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("audio read frame: %w", err)
 			}
-			return fmt.Errorf("audio read frame: %w", err)
 		}
 		if n == 0 {
 			continue
@@ -740,7 +833,6 @@ func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, 
 		copy(payload, frameBuf[:n])
 
 		frameCount++
-
 		if !useFEC {
 			// Single-send: send each frame once
 			if _, err := audioStream.sendAudioPacketWithSeqAndNonce(payload, nextRtp, frameSeq, nil); err != nil {
