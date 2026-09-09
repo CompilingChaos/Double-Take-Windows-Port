@@ -149,8 +149,12 @@ and video when the advertised audio format is unavailable.
 ## Network discovery
 
 Doubletake uses multicast DNS (mDNS) discovery on Windows and Linux. This is a
-small multicast query rather than a scan of the local address range. On managed
-networks that filter mDNS, connect directly with `-target RECEIVER-IP`.
+small multicast query rather than a scan of the local address range. When a
+Windows network filters mDNS, Doubletake also checks up to 64 real peers already
+present in the operating system's neighbor table. It caches that small fallback
+for 30 seconds and never fills the neighbor table by sweeping the subnet. If the
+receiver is not already known to Windows, connect directly with
+`-target RECEIVER-IP`.
 
 Windows also has an optional fallback for trusted networks where mDNS is
 unavailable. Setting `DOUBLETAKE_DISCOVERY_SUBNET_SCAN=1` probes TCP port 7000

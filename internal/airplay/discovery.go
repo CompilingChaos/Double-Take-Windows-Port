@@ -85,10 +85,6 @@ func DiscoverAirPlayDevices(ctx context.Context) ([]AirPlayDevice, error) {
 }
 
 func discoverAirPlayDevicesWindows(ctx context.Context) ([]AirPlayDevice, error) {
-	if !activeSubnetScanEnabled() {
-		return browseAirPlayDevices(ctx)
-	}
-
 	type discoveryResult struct {
 		devices []AirPlayDevice
 		err     error
@@ -104,7 +100,13 @@ func discoverAirPlayDevicesWindows(ctx context.Context) ([]AirPlayDevice, error)
 		mdnsResults <- discoveryResult{devices: devices, err: err}
 	}()
 	go func() {
-		devices, err := scanLocalAirPlayDevices(ctx)
+		var devices []AirPlayDevice
+		var err error
+		if activeSubnetScanEnabled() {
+			devices, err = scanLocalAirPlayDevices(ctx)
+		} else {
+			devices, err = scanKnownAirPlayDevices(ctx)
+		}
 		scanResults <- discoveryResult{devices: devices, err: err}
 	}()
 
@@ -181,11 +183,57 @@ func scanLocalAirPlayDevices(ctx context.Context) ([]AirPlayDevice, error) {
 		return nil, nil
 	}
 	dbg("[DISCOVERY] probing %d hosts on local subnet", len(targets))
+	return probeAirPlayTargets(ctx, targets, 192)
+
+}
+
+const (
+	maxKnownNeighborTargets = 64
+	knownNeighborCacheTTL   = 30 * time.Second
+)
+
+var knownNeighborDiscoveryCache struct {
+	sync.Mutex
+	updated time.Time
+	devices []AirPlayDevice
+}
+
+func scanKnownAirPlayDevices(ctx context.Context) ([]AirPlayDevice, error) {
+	knownNeighborDiscoveryCache.Lock()
+	if time.Since(knownNeighborDiscoveryCache.updated) < knownNeighborCacheTTL {
+		devices := append([]AirPlayDevice(nil), knownNeighborDiscoveryCache.devices...)
+		knownNeighborDiscoveryCache.Unlock()
+		return devices, nil
+	}
+	knownNeighborDiscoveryCache.Unlock()
+
+	targets := knownNeighborTargets(preferredDiscoveryInterfaces())
+	if len(targets) > maxKnownNeighborTargets {
+		targets = targets[:maxKnownNeighborTargets]
+	}
+	if len(targets) == 0 {
+		return nil, nil
+	}
+
+	dbg("[DISCOVERY] mDNS fallback checking %d known network peers", len(targets))
+	devices, err := probeAirPlayTargets(ctx, targets, 8)
+	if err != nil || ctx.Err() != nil {
+		return devices, err
+	}
+
+	knownNeighborDiscoveryCache.Lock()
+	knownNeighborDiscoveryCache.updated = time.Now()
+	knownNeighborDiscoveryCache.devices = append([]AirPlayDevice(nil), devices...)
+	knownNeighborDiscoveryCache.Unlock()
+	return devices, nil
+}
+
+func probeAirPlayTargets(ctx context.Context, targets []string, maxWorkers int) ([]AirPlayDevice, error) {
 
 	targetCh := make(chan string)
 	resultCh := make(chan AirPlayDevice, 16)
 	var wg sync.WaitGroup
-	workers := 192
+	workers := maxWorkers
 	if len(targets) < workers {
 		workers = len(targets)
 	}
@@ -317,7 +365,7 @@ func probeAirPlayInfo(ctx context.Context, ip string, port int) (AirPlayDevice, 
 	if name == "" {
 		name = ip
 	}
-	dbg("[DISCOVERY] found AirPlay receiver by subnet scan: %s %s:%d (%s)", name, ip, port, info.Model)
+	dbg("[DISCOVERY] found AirPlay receiver by direct probe: %s %s:%d (%s)", name, ip, port, info.Model)
 	return AirPlayDevice{
 		Name:            name,
 		Model:           info.Model,
