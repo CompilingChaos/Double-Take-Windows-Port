@@ -359,6 +359,9 @@ func TestAudioVolumeBody(t *testing.T) {
 }
 
 func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
+	SetTargetLatency(0)
+	t.Cleanup(func() { SetTargetLatency(0) })
+
 	for _, test := range []struct {
 		name       string
 		skipRecord bool
@@ -373,6 +376,7 @@ func TestSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T) {
 }
 
 func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord bool) {
+	ntpTargets := screenLatenciesForHint(connectionLatencyNormal).withMinimumVideoLead(ntpPlayoutLatencyFloor)
 	eventListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen event channel: %v", err)
@@ -536,7 +540,7 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 						serverErr <- fmt.Errorf("audio latencyMin = %d, want 0", got)
 						return
 					}
-					if got, want := plistInt(stream["latencyMax"]), int(samplesFor44k1(ntpPlayoutLatencyFloor)); got != want {
+					if got, want := plistInt(stream["latencyMax"]), int(samplesFor44k1(ntpTargets.audio)); got != want {
 						serverErr <- fmt.Errorf("audio latencyMax = %d, want %d", got, want)
 						return
 					}
@@ -553,6 +557,10 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 					}, plist.BinaryFormat)
 					waitForEvent = true
 				case 110:
+					if got := plistInt(stream["latencyMs"]); got != int(ntpTargets.video/time.Millisecond) {
+						serverErr <- fmt.Errorf("video latencyMs = %d, want %d", got, ntpTargets.video/time.Millisecond)
+						return
+					}
 					if got, _ := setup["timingProtocol"].(string); got != timingProtocolNTP {
 						serverErr <- fmt.Errorf("expected timingProtocol NTP in video setup, got %q", got)
 						return
@@ -652,8 +660,11 @@ func testSetupMirrorNoAudioStillNegotiatesAudioSession(t *testing.T, skipRecord 
 	if !session.HasAudio() {
 		t.Fatal("expected no-audio session setup to keep the negotiated audio stream state")
 	}
-	if !skipRecord && session.timestampBias != 250*time.Millisecond {
-		t.Fatalf("session timestamp bias = %v, want RECORD Audio-Latency of 250ms", session.timestampBias)
+	if session.timestampBias != ntpTargets.video {
+		t.Fatalf("session timestamp bias = %v, want %v", session.timestampBias, ntpTargets.video)
+	}
+	if got, want := session.audioStream.latencySamples, samplesFor44k1(ntpTargets.audio); got != want {
+		t.Fatalf("TimeAnnounce lead = %d samples, want %d", got, want)
 	}
 
 	select {

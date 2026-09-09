@@ -27,7 +27,7 @@ func CheckFFmpeg() error {
 func ffmpegExecutable() (string, error) {
 	ffmpegOnce.Do(func() {
 		executablePath, executableErr := os.Executable()
-		ffmpegPath, bundled, err := locateFFmpeg(executablePath, exec.LookPath)
+		resolvedPath, bundled, err := locateFFmpeg(executablePath, exec.LookPath)
 		if err != nil {
 			if executableErr != nil {
 				ffmpegErr = fmt.Errorf("%w (the application directory could not be determined: %v)", err, executableErr)
@@ -36,6 +36,7 @@ func ffmpegExecutable() (string, error) {
 			}
 			return
 		}
+		ffmpegPath = resolvedPath
 		if bundled {
 			log.Printf("[SETUP] FFmpeg found next to doubletake.exe: %s", ffmpegPath)
 		} else {

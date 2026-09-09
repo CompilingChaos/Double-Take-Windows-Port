@@ -6,20 +6,21 @@ doubletake \- AirPlay screen mirroring sender for Windows and Linux
 [\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B doubletake
-is an AirPlay screen mirroring sender that streams your desktop to Apple TV, Mac,
-and compatible third-party receivers using the AirPlay mirroring protocol.
-It supports Windows desktop capture,
-Wayland (PipeWire/xdg-desktop-portal), and X11 screen capture with
-hardware-accelerated H.264 encoding.
+is an AirPlay screen mirroring sender that streams a Windows or Linux desktop
+to Apple TV, Mac, and compatible third-party receivers. Windows capture uses
+FFmpeg and native WASAPI audio. Linux capture supports Wayland
+(PipeWire/xdg-desktop-portal) and X11.
 .SH FEATURES
 .IP \(bu 2
-Full AirPlay 2 mirroring protocol (RTSP/HTTP + encrypted video stream)
+Full AirPlay mirroring protocol (RTSP/HTTP + encrypted video stream)
 .IP \(bu 2
 FairPlay SAP authentication
 .IP \(bu 2
-Legacy and modern AirPlay pairing, password authentication, and persistent credential storage
+SRP-6a pairing with PIN and persistent credential storage
 .IP \(bu 2
-Hardware-accelerated H.264 encoding (D3D11/NVENC/VA-API) with software fallback
+H.264 encoding with FFmpeg on Windows and NVENC, VA-API, OpenH264, or x264 on Linux
+.IP \(bu 2
+Capability-gated HEVC Main10/high-resolution encoding with FFmpeg NVENC or libx265 on Windows
 .IP \(bu 2
 ChaCha20-Poly1305 stream encryption
 .IP \(bu 2
@@ -36,10 +37,25 @@ Connect to a specific AirPlay receiver by IP address (skips mDNS discovery)
 AirPlay port (default: 7000)
 .TP
 .B \-code \fICODE\fR
-Pairing code or receiver password
+Pairing PIN shown on the receiver, or its configured password when
+"Require Password" is enabled. Prefer the
+.B DOUBLETAKE_CODE
+environment variable, which keeps the code out of shell history and
+.BR ps (1)
+output.
+.PP
+The entered value is retained across reconnects and is used for both SRP
+pairing and a later HTTP Digest challenge when the receiver requires both.
+.PP
+Interactive mode prompts only once after identifying the receiver's security
+mode. In the Plasma applet, an on-screen PIN uses a visible four-digit field and
+a configured receiver password uses an unrestricted masked field. Doubletake
+does not request an on-screen PIN in password mode.
 .TP
-.B \-pin \fICODE\fR
-Backward-compatible alias for \fB\-code\fR
+.B \-port-range \fIMIN-MAX\fR
+Confine local timing and audio UDP sockets to a range of at least three ports,
+including streams started in daemon mode. Reserve three available ports per
+simultaneous receiver.
 .TP
 .B \-pair
 Force new pairing even if credentials exist
@@ -48,7 +64,7 @@ Force new pairing even if credentials exist
 Credential storage backend: \fBfile\fR or \fBkeyring\fR (default: file)
 .TP
 .B \-creds \fIPATH\fR
-Path to credentials file (default: OS-specific)
+Path to credentials file (uses the operating system default when omitted)
 .TP
 .B \-fps \fIFPS\fR
 Frames per second (default: 30)
@@ -57,13 +73,29 @@ Frames per second (default: 30)
 Target bitrate in kbps (0 = auto, default: 0)
 .TP
 .B \-target-latency-ms \fIMS\fR
-Target playout latency in milliseconds (default: 100)
+Override both audio and video playout latency in milliseconds. Zero selects the
+automatic AirPlay policy with separate screen and audio defaults (default: 0).
 .TP
 .B \-no-audio
 Disable audio for video-only mirroring
 .TP
 .B \-hwaccel \fIMETHOD\fR
-Hardware acceleration method: \fBauto\fR, \fBnvenc\fR, \fBvaapi\fR, or \fBnone\fR
+Encoder preference: \fBauto\fR, \fBnvenc\fR (NVIDIA), \fBvaapi\fR
+(Intel/AMD), \fBopenh264\fR (software), or \fBnone\fR (x264, or x265 for
+forced HEVC).
+Windows supports \fBauto\fR, \fBnvenc\fR, and \fBnone\fR. Linux also supports
+the GStreamer VA-API and OpenH264 methods. The default is \fBauto\fR.
+.TP
+.B \-video-codec \fICODEC\fR
+Screen codec: capability-driven \fBauto\fR (default), forced \fBh264\fR, or
+forced \fBhevc\fR. Automatic HEVC requires receiver feature 42, a session-time
+maximum above 1920x1080, and an available local hardware Main10 path;
+otherwise it uses H.264 at the nominal canvas. On Windows, forced HEVC may also
+use libx265. The split Linux adapter in this port retains H.264 capture.
+Main10 output does not fabricate HDR metadata for an SDR capture source.
+.TP
+.B \-no-cursor
+Hide the mouse cursor in captured video.
 .TP
 .B \-debug
 Enable verbose protocol logging
@@ -71,18 +103,25 @@ Enable verbose protocol logging
 .B \-daemonize
 Run in daemon mode for multi-target control via
 .B doubletake-ctl
+.TP
+.B \-socket \fIENDPOINT\fR
+Set the local daemon control endpoint. The default is 127.0.0.1:53531 on
+Windows and $XDG_RUNTIME_DIR/doubletake.sock on Unix.
 .SH EXAMPLES
 .TP
 Discover and connect to an AirPlay receiver on the network:
 .B doubletake
 .TP
-Connect to a specific AirPlay receiver:
+Connect to a specific receiver:
 .B doubletake \-target 192.168.1.77
 .TP
 Pair with a PIN (saves credentials for reuse):
 .B doubletake \-target 192.168.1.77 \-pair \-code 1234
 .TP
-Stream with custom frame rate and bitrate:
+Connect to a receiver with "Require Password" enabled:
+.B DOUBLETAKE_CODE=... doubletake \-target 192.168.1.77
+.TP
+Stream with a custom frame rate and bitrate:
 .B doubletake \-target 192.168.1.77 \-fps 30 \-bitrate 4500
 .TP
 Force lower bitrate on weak Wi-Fi:
@@ -90,6 +129,9 @@ Force lower bitrate on weak Wi-Fi:
 .TP
 Use hardware acceleration (NVIDIA):
 .B doubletake \-target 192.168.1.77 \-hwaccel nvenc
+.TP
+Use OpenH264 software encoding:
+.B doubletake \-target 192.168.1.77 \-hwaccel openh264
 .TP
 Run in daemon mode:
 .B doubletake \-daemonize
@@ -101,26 +143,38 @@ When run with \fB\-daemonize\fR, doubletake runs as a background service that ca
 multiple simultaneous connections. Use
 .B doubletake-ctl
 to manage the daemon.
+.PP
+Daemon status distinguishes an on-screen PIN from a configured password so UI
+clients can present the appropriate single prompt. Both values remain
+submittable with the compatible
+.B doubletake-ctl pin
+command when exactly one receiver is waiting. For concurrent prompts, use
+.B doubletake-ctl connect \fITARGET\fR \fIPIN-OR-PASSWORD\fR
+to submit a credential to a specific receiver.
 .SH REQUIREMENTS
 .IP \(bu 2
 Go 1.23 or later
 .IP \(bu 2
-GStreamer 1.0 (with plugins-base, plugins-good, plugins-bad, plugins-ugly, libav)
+Windows: FFmpeg; native WASAPI loopback is used for audio
 .IP \(bu 2
-Windows desktop capture, PipeWire (Wayland), or X11 for screen capture
+Linux: GStreamer 1.0 (with plugins-base, plugins-good, plugins-bad, plugins-ugly, libav)
+.IP \(bu 2
+The \fBopenh264\fR method requires the GStreamer \fBopenh264enc\fR element
+.IP \(bu 2
+Linux: PipeWire (Wayland) or X11 for screen capture
 .SH FILES
-.TP
-.I %APPDATA%\\doubletake\\credentials.json
-Default location for saved AirPlay credentials on Windows
 .TP
 .I ~/.config/doubletake/credentials.json
 Default location for saved AirPlay credentials
 .SH SEE ALSO
-.B doubletake-ctl(1)
+.BR doubletake-ctl (1),
+.BR doubletake-test-receiver (1)
 .SH AUTHOR
 Written by Omar Roth.
 .SH LICENSE
-License GPLv3+: GNU GPL version 3 or later.
+License LGPLv3+: GNU LGPL version 3 or later.
+.PP
+Releases v0.3.2 and earlier were provided under GPLv3+: GNU GPL version 3 or later.
 .PP
 This is free software: you are free to change and redistribute it.
 .PP

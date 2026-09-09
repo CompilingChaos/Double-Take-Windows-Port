@@ -46,8 +46,8 @@ func parsePortRange(s string) (int, int, error) {
 	if lo < 1 || hi > 65535 || lo > hi {
 		return 0, 0, fmt.Errorf("range %d-%d out of bounds (1-65535, min<=max)", lo, hi)
 	}
-	if hi-lo+1 < 4 {
-		return 0, 0, fmt.Errorf("range %d-%d too small; need at least 4 ports (3 UDP + 1 TCP)", lo, hi)
+	if hi-lo+1 < 3 {
+		return 0, 0, fmt.Errorf("range %d-%d too small; need at least 3 consecutive UDP ports", lo, hi)
 	}
 	return lo, hi, nil
 }
@@ -66,21 +66,33 @@ func main() {
 	forcePair := flag.Bool("pair", false, "Force new pairing even if credentials exist")
 	fps := flag.Int("fps", 30, "Frames per second")
 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
-	targetLatencyMs := flag.Int("target-latency-ms", 100, "Target end-to-end latency in milliseconds (applies to audio and video timing)")
-	hwaccel := flag.String("hwaccel", "auto", "Hardware acceleration: auto, nvenc, vaapi, none")
+	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic AirPlay policy)")
+	hwaccelHelp := "Hardware acceleration: auto, nvenc, vaapi, none"
+	if runtime.GOOS == "windows" {
+		hwaccelHelp = "Hardware acceleration: auto, nvenc, none"
+	}
+	hwaccel := flag.String("hwaccel", "auto", hwaccelHelp)
+	videoCodec := flag.String("video-codec", "auto", "Screen codec: auto, h264, or hevc (auto uses hardware HEVC for capable high-resolution receivers)")
 	testMode := flag.Bool("test", false, "Use synthetic video instead of screen capture for debugging")
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
 	noAudio := flag.Bool("no-audio", false, "Disable audio streaming")
-	portRange := flag.String("port-range", "", "Local UDP/TCP port range for the receiver to reach back (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 4 ports.")
+	portRange := flag.String("port-range", "", "Local UDP port range for receiver timing/audio (e.g. \"60000-60010\"); empty = OS ephemeral. Needs at least 3 ports.")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	daemonize := flag.Bool("daemonize", false, "Run as background daemon with a local control interface")
 	socketPath := flag.String("socket", daemon.DefaultSocketPath(), "Daemon control endpoint (Unix socket path or Windows host:port)")
+	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
 	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
 		exitProgram(2)
+	}
+	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
+		fatalf("invalid -hwaccel: %v", err)
+	}
+	if err := airplay.ValidateVideoCodec(*videoCodec); err != nil {
+		fatalf("invalid -video-codec: %v", err)
 	}
 	portMin, portMax, err := parsePortRange(*portRange)
 	if err != nil {
@@ -93,9 +105,13 @@ func main() {
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
 	airplay.SetDebugMode(*debug)
+	credential := credentialFlag
+	if env := os.Getenv("DOUBLETAKE_CODE"); env != "" {
+		credential = env
+	}
 
 	if *daemonize {
-		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, portMin, portMax, *hwaccel, *debug, *testMode, *noEncrypt, *directKey, *noAudio)
+		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, portMin, portMax, *hwaccel, airplay.VideoCodec(*videoCodec), !*noCursor, credential, *debug, *testMode, *noEncrypt, *directKey, *noAudio)
 		return
 	}
 
@@ -147,10 +163,6 @@ func main() {
 			return airplay.NewAirPlayClientForDevice(device)
 		}
 		return airplay.NewAirPlayClient(addr, *port)
-	}
-	credential := credentialFlag
-	if env := os.Getenv("DOUBLETAKE_CODE"); env != "" {
-		credential = env
 	}
 	client := newClient()
 	client.SetPassword(credential)
@@ -246,7 +258,7 @@ func main() {
 	} else if savedCreds != nil && savedCreds.HasPairingCredentials() {
 		// Use saved credentials — pair-verify
 		log.Printf("using saved credentials (%s)", *credBackend)
-		verifyErr := client.RestorePairingCredentials(savedCreds)
+		verifyErr := restoreSavedPairing(client, savedCreds)
 		if verifyErr == nil {
 			verifyErr = client.PairVerify(ctx)
 		}
@@ -291,27 +303,31 @@ func main() {
 	}
 
 	streamCfg := airplay.StreamConfig{
-		FPS:       *fps,
-		Bitrate:   *bitrate,
-		NoEncrypt: *noEncrypt,
-		DirectKey: *directKey,
-		NoAudio:   *noAudio,
-		PortMin:   portMin,
-		PortMax:   portMax,
+		FPS:                    *fps,
+		Bitrate:                *bitrate,
+		VideoCodec:             airplay.VideoCodec(*videoCodec),
+		AutomaticHEVCAvailable: airplay.AutomaticHEVCAvailable(*hwaccel),
+		NoEncrypt:              *noEncrypt,
+		DirectKey:              *directKey,
+		NoAudio:                *noAudio,
+		PortMin:                portMin,
+		PortMax:                portMax,
 	}
 	var captureWidth, captureHeight int
-	prepareVideo := func(width, height int) error {
+	var captureCodec airplay.VideoCodec
+	prepareVideo := func(width, height int, codec airplay.VideoCodec) error {
 		captureWidth, captureHeight = width, height
+		captureCodec = codec
 		return nil
 	}
-	session, err := client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+	session, err := client.SetupMirrorWithVideoCodecPreparation(ctx, streamCfg, prepareVideo)
 	if errors.Is(err, airplay.ErrCredentialsRequired) && credential == "" {
 		credential = readCredential(bufio.NewReader(os.Stdin), "Enter the code shown on the receiver, or its configured password: ")
 		if credential == "" {
 			fatalf("receiver code/password cannot be empty")
 		}
 		client.SetPassword(credential)
-		session, err = client.SetupMirrorWithVideoPreparation(ctx, streamCfg, prepareVideo)
+		session, err = client.SetupMirrorWithVideoCodecPreparation(ctx, streamCfg, prepareVideo)
 	}
 	if err != nil {
 		fatalf("mirror setup failed: %v", err)
@@ -328,22 +344,26 @@ func main() {
 		}
 		var err error
 		capture, err = airplay.StartTestCapture(ctx, airplay.CaptureConfig{
-			FPS:       *fps,
-			Bitrate:   *bitrate,
-			HWAccel:   *hwaccel,
-			MaxWidth:  captureWidth,
-			MaxHeight: captureHeight,
+			FPS:        *fps,
+			Bitrate:    *bitrate,
+			HWAccel:    *hwaccel,
+			VideoCodec: captureCodec,
+			MaxWidth:   captureWidth,
+			MaxHeight:  captureHeight,
+			ShowCursor: !*noCursor,
 		})
 		if err != nil {
 			fatalf("test capture failed: %v", err)
 		}
 	} else {
 		captureCfg := airplay.CaptureConfig{
-			FPS:       *fps,
-			Bitrate:   *bitrate,
-			HWAccel:   *hwaccel,
-			MaxWidth:  captureWidth,
-			MaxHeight: captureHeight,
+			FPS:        *fps,
+			Bitrate:    *bitrate,
+			HWAccel:    *hwaccel,
+			VideoCodec: captureCodec,
+			MaxWidth:   captureWidth,
+			MaxHeight:  captureHeight,
+			ShowCursor: !*noCursor,
 		}
 		var err error
 		capture, err = airplay.StartCapture(ctx, captureCfg)
@@ -394,10 +414,7 @@ func credentialOrPrompt(value string, client *airplay.AirPlayClient, info *airpl
 		}
 		log.Printf("warning: failed to trigger PIN display: %v", displayErr)
 	}
-	prompt := "Enter the receiver's configured password or pairing PIN: "
-	if expectPIN && displayErr == nil {
-		prompt = "Enter the PIN shown on the receiver: "
-	}
+	prompt := pairingCredentialPrompt(expectPIN, displayErr)
 	credential := readCredential(bufio.NewReader(os.Stdin), prompt)
 	if credential == "" {
 		fatalf("pairing credential cannot be empty")
@@ -405,8 +422,19 @@ func credentialOrPrompt(value string, client *airplay.AirPlayClient, info *airpl
 	return credential
 }
 
+func pairingCredentialPrompt(expectPIN bool, displayErr error) string {
+	if expectPIN && displayErr == nil {
+		return "Enter the PIN shown on the receiver: "
+	}
+	return "Enter the receiver's configured password or pairing PIN: "
+}
+
 func passwordRequiresPairing(info *airplay.ReceiverInfo) bool {
 	return info != nil && info.RequiredPairingCredential() == airplay.PairingCredentialPassword
+}
+
+func restoreSavedPairing(client *airplay.AirPlayClient, saved *airplay.SavedCredentials) error {
+	return client.RestorePairingCredentials(saved)
 }
 
 func forcePairUsesTransient(info *airplay.ReceiverInfo) bool {
@@ -516,7 +544,7 @@ func compareIPs(a, b string) int {
 	return 0
 }
 
-func runDaemon(socketPath, credFile, credBackend string, fps, bitrate, portMin, portMax int, hwaccel string, debug, testMode, noEncrypt, directKey, noAudio bool) {
+func runDaemon(socketPath, credFile, credBackend string, fps, bitrate, portMin, portMax int, hwaccel string, videoCodec airplay.VideoCodec, showCursor bool, code string, debug, testMode, noEncrypt, directKey, noAudio bool) {
 	cfg := daemon.Config{
 		SocketPath:  socketPath,
 		CredFile:    credFile,
@@ -526,6 +554,9 @@ func runDaemon(socketPath, credFile, credBackend string, fps, bitrate, portMin, 
 		PortMin:     portMin,
 		PortMax:     portMax,
 		HWAccel:     hwaccel,
+		VideoCodec:  videoCodec,
+		ShowCursor:  showCursor,
+		Code:        code,
 		Debug:       debug,
 		TestMode:    testMode,
 		NoEncrypt:   noEncrypt,

@@ -29,7 +29,9 @@ if ($Release) {
 if ($ldflags) {
     go build -ldflags $ldflags -o "bin\doubletake.exe" ".\cmd\doubletake"
     go build -ldflags $ldflags -o "bin\doubletake-ctl.exe" ".\cmd\doubletake-ctl"
+    go build -ldflags $ldflags -o "bin\doubletake-test-receiver.exe" ".\cmd\doubletake-test-receiver"
 } else {
     go build -o "bin\doubletake.exe" ".\cmd\doubletake"
     go build -o "bin\doubletake-ctl.exe" ".\cmd\doubletake-ctl"
+    go build -o "bin\doubletake-test-receiver.exe" ".\cmd\doubletake-test-receiver"
 }

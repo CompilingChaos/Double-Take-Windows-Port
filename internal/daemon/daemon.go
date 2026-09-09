@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -29,6 +30,16 @@ const (
 	StatePINRequired State = "pin_required"
 )
 
+// CredentialKind tells a control client which single authentication value the
+// receiver is waiting for. StatePINRequired is retained as the wire-compatible
+// waiting state; new clients should use CredentialKind to choose their prompt.
+type CredentialKind string
+
+const (
+	CredentialKindPIN      CredentialKind = "pin"
+	CredentialKindPassword CredentialKind = "password"
+)
+
 // Request is a command sent to the daemon over the control socket.
 type Request struct {
 	Cmd    string `json:"cmd"`
@@ -39,25 +50,30 @@ type Request struct {
 
 // StreamInfo describes one active (or connecting) mirror stream.
 type StreamInfo struct {
-	Device     string `json:"device"`
-	DeviceIP   string `json:"device_ip"`
-	State      State  `json:"state"`
-	HasAudio   bool   `json:"has_audio"`
-	AudioMuted bool   `json:"audio_muted"`
+	Device         string         `json:"device"`
+	DeviceIP       string         `json:"device_ip"`
+	State          State          `json:"state"`
+	HasAudio       bool           `json:"has_audio"`
+	AudioMuted     bool           `json:"audio_muted"`
+	CredentialKind CredentialKind `json:"credential_kind,omitempty"`
 }
 
 // Response is returned to the caller for every request.
 type Response struct {
-	OK         bool         `json:"ok"`
-	State      State        `json:"state"`
-	Device     string       `json:"device,omitempty"`
-	DeviceIP   string       `json:"device_ip,omitempty"`
-	HasAudio   bool         `json:"has_audio"`
-	AudioMuted bool         `json:"audio_muted"`
-	NeedsPIN   bool         `json:"needs_pin,omitempty"`
-	Error      string       `json:"error,omitempty"`
-	Devices    []DeviceInfo `json:"devices,omitempty"`
-	Streams    []StreamInfo `json:"streams,omitempty"`
+	OK         bool   `json:"ok"`
+	State      State  `json:"state"`
+	Device     string `json:"device,omitempty"`
+	DeviceIP   string `json:"device_ip,omitempty"`
+	HasAudio   bool   `json:"has_audio"`
+	AudioMuted bool   `json:"audio_muted"`
+	// NeedsPIN is retained for older clients and is true only for an on-screen
+	// PIN. NeedsCredential and CredentialKind distinguish configured passwords.
+	NeedsPIN        bool           `json:"needs_pin,omitempty"`
+	NeedsCredential bool           `json:"needs_credential,omitempty"`
+	CredentialKind  CredentialKind `json:"credential_kind,omitempty"`
+	Error           string         `json:"error,omitempty"`
+	Devices         []DeviceInfo   `json:"devices,omitempty"`
+	Streams         []StreamInfo   `json:"streams,omitempty"`
 }
 
 // DeviceInfo is a simplified view of a discovered AirPlay device.
@@ -76,17 +92,46 @@ type Config struct {
 	CredBackend string
 	FPS         int
 	Bitrate     int
-	PortMin     int
-	PortMax     int
+	PortMin     int // inclusive local UDP port bound; zero with PortMax means ephemeral
+	PortMax     int // inclusive local UDP port bound; zero with PortMin means ephemeral
 	HWAccel     string
+	VideoCodec  airplay.VideoCodec
 	Debug       bool
 	TestMode    bool
 	NoEncrypt   bool
 	DirectKey   bool
 	NoAudio     bool
+	ShowCursor  bool
+	Code        string // default pairing/Digest credential; request Pin overrides it
 }
 
-// DefaultSocketPath returns the default daemon control endpoint.
+func (d *Daemon) mirrorStreamConfig() airplay.StreamConfig {
+	return airplay.StreamConfig{
+		FPS:        d.cfg.FPS,
+		Bitrate:    d.cfg.Bitrate,
+		VideoCodec: d.cfg.VideoCodec,
+		NoEncrypt:  d.cfg.NoEncrypt,
+		DirectKey:  d.cfg.DirectKey,
+		NoAudio:    d.cfg.NoAudio,
+		PortMin:    d.cfg.PortMin,
+		PortMax:    d.cfg.PortMax,
+	}
+}
+
+func validatePortRange(portMin, portMax int) error {
+	if portMin == 0 && portMax == 0 {
+		return nil
+	}
+	if portMin < 1 || portMax > 65535 || portMin > portMax {
+		return fmt.Errorf("range %d-%d out of bounds (1-65535, min<=max)", portMin, portMax)
+	}
+	if portMax-portMin+1 < 3 {
+		return fmt.Errorf("range %d-%d too small; need 3 consecutive UDP ports", portMin, portMax)
+	}
+	return nil
+}
+
+// DefaultSocketPath returns the default socket path using XDG_RUNTIME_DIR.
 func DefaultSocketPath() string {
 	if runtime.GOOS == "windows" {
 		return "127.0.0.1:53531"
@@ -100,15 +145,103 @@ func DefaultSocketPath() string {
 
 // activeStream tracks the state of a single mirroring session to one receiver.
 type activeStream struct {
-	device     string // friendly name
-	deviceIP   string
-	deviceID   string
-	state      State
-	audioMuted bool
-	session    *airplay.MirrorSession
-	client     *airplay.AirPlayClient
-	sink       *airplay.BroadcastSink // fan-out video sink (nil when no broadcast)
-	cancelFn   context.CancelFunc
+	device         string // friendly name
+	deviceIP       string
+	deviceID       string
+	state          State
+	audioMuted     bool
+	session        *airplay.MirrorSession
+	client         *airplay.AirPlayClient
+	sink           *airplay.BroadcastSink // fan-out video sink (nil when no broadcast)
+	captureGroup   *videoCaptureGroup     // encoder group selected from the resolved nominal canvas
+	cancelFn       context.CancelFunc
+	credentialCh   chan string
+	credentialKind CredentialKind
+}
+
+// videoCaptureKey identifies captures which can safely share one encoded
+// stream. Capture settings are daemon-wide, so only the receiver's nominal
+// canvas and codec vary between concurrent targets.
+type videoCaptureKey struct {
+	maxWidth  int
+	maxHeight int
+	codec     airplay.VideoCodec
+}
+
+// videoCaptureGroup owns one capture/encoder and its byte-stream fan-out. A
+// receiver can join only the group matching its resolved nominal canvas, so a
+// lower-resolution receiver never inherits a larger first target's encoding.
+type videoCaptureGroup struct {
+	key              videoCaptureKey
+	broadcast        *airplay.BroadcastCapture
+	capture          *airplay.ScreenCapture
+	minimumVideoLead time.Duration
+	cancel           context.CancelFunc
+}
+
+// daemonCleanup owns resources detached from the daemon's state maps. Building
+// a cleanup plan while holding d.mu makes the state change atomic; running it
+// afterwards keeps cancellation, pipe closure, RTSP teardown, socket closure,
+// and process shutdown from blocking unrelated daemon requests.
+type daemonCleanup struct {
+	cancels  []context.CancelFunc
+	sinks    []*airplay.BroadcastSink
+	sessions []*airplay.MirrorSession
+	clients  []*airplay.AirPlayClient
+	captures []*airplay.ScreenCapture
+}
+
+func (cleanup *daemonCleanup) addStream(entry *activeStream) {
+	if entry.cancelFn != nil {
+		cleanup.cancels = append(cleanup.cancels, entry.cancelFn)
+		entry.cancelFn = nil
+	}
+	if entry.sink != nil {
+		cleanup.sinks = append(cleanup.sinks, entry.sink)
+		entry.sink = nil
+	}
+	if entry.session != nil {
+		cleanup.sessions = append(cleanup.sessions, entry.session)
+		entry.session = nil
+	}
+	if entry.client != nil {
+		cleanup.clients = append(cleanup.clients, entry.client)
+		entry.client = nil
+	}
+	entry.captureGroup = nil
+}
+
+func (cleanup *daemonCleanup) addCaptureGroup(group *videoCaptureGroup) {
+	if group.cancel != nil {
+		cleanup.cancels = append(cleanup.cancels, group.cancel)
+		group.cancel = nil
+	}
+	if group.capture != nil {
+		cleanup.captures = append(cleanup.captures, group.capture)
+		group.capture = nil
+	}
+	group.broadcast = nil
+}
+
+// run may block and therefore must never be called with d.mu held. Cancel all
+// producers and close all fan-out pipes before waiting for protocol or capture
+// teardown, so independent stream workers can start unwinding promptly.
+func (cleanup *daemonCleanup) run() {
+	for _, cancel := range cleanup.cancels {
+		cancel()
+	}
+	for _, sink := range cleanup.sinks {
+		sink.Close()
+	}
+	for _, session := range cleanup.sessions {
+		_ = session.Close()
+	}
+	for _, client := range cleanup.clients {
+		_ = client.Close()
+	}
+	for _, capture := range cleanup.captures {
+		capture.Stop()
+	}
 }
 
 // Daemon manages a long-running doubletake service.
@@ -120,21 +253,36 @@ type Daemon struct {
 	credStore      *airplay.CredentialStore
 
 	// Multi-stream state
-	streams       map[string]*activeStream  // keyed by target IP
-	broadcast     *airplay.BroadcastCapture // shared video fan-out; nil when no streams active
-	capture       *airplay.ScreenCapture    // underlying screen capture
-	captureCancel context.CancelFunc        // cancellation for shared capture context
-
-	// PIN-waiting state (at most one device waits for a PIN at a time)
-	pendingTarget string
-	pendingPort   int
+	streams         map[string]*activeStream               // keyed by target IP
+	captureGroups   map[videoCaptureKey]*videoCaptureGroup // one encoder/fan-out per advertised canvas
+	capturePortalMu sync.Mutex                             // serializes interactive Wayland portal access
+	captureStartMu  sync.Mutex                             // serializes exact-size group publication/encoder startup
+	lastError       string                                 // most recent asynchronous stream failure
+	lastErrorTarget string                                 // target associated with lastError; empty for capture-wide errors
 
 	discoverCancel context.CancelFunc
 	listener       net.Listener
+	streamWorkers  sync.WaitGroup // stream, capture, and externally detached cleanup workers
+	shuttingDown   bool
 }
 
 // New creates a new Daemon with the given configuration.
 func New(cfg Config) (*Daemon, error) {
+	if err := airplay.ValidateHWAccel(cfg.HWAccel); err != nil {
+		return nil, fmt.Errorf("hwaccel: %w", err)
+	}
+	if err := airplay.ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
+		return nil, fmt.Errorf("video codec: %w", err)
+	}
+	if cfg.VideoCodec == "" {
+		cfg.VideoCodec = airplay.VideoCodecAuto
+	}
+	if err := validatePortRange(cfg.PortMin, cfg.PortMax); err != nil {
+		return nil, fmt.Errorf("port range: %w", err)
+	}
+	if cfg.HWAccel == "" {
+		cfg.HWAccel = "auto"
+	}
 	var cs *airplay.CredentialStore
 	switch cfg.CredBackend {
 	case "keyring":
@@ -159,39 +307,55 @@ func New(cfg Config) (*Daemon, error) {
 		cfg:            cfg,
 		deviceLastSeen: make(map[string]time.Time),
 		streams:        make(map[string]*activeStream),
+		captureGroups:  make(map[videoCaptureKey]*videoCaptureGroup),
 		credStore:      cs,
 	}, nil
 }
 
-// Run starts the daemon control endpoint and blocks until ctx is cancelled.
+// Run starts the daemon control socket and blocks until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context) error {
 	airplay.SetDebugMode(d.cfg.Debug)
-	network := controlNetwork()
-	if network == "unix" {
-		// Clean up stale socket.
-		if err := os.Remove(d.cfg.SocketPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove stale socket: %w", err)
-		}
+
+	// Acquire an advisory lock before removing a stale socket. Without this, a
+	// second daemon can unlink the first daemon's live listener and bind a new
+	// socket at the same pathname, leaving both daemons and their captures alive.
+	instanceLock, err := acquireInstanceLock(d.cfg.SocketPath)
+	if err != nil {
+		return err
+	}
+	defer releaseInstanceLock(instanceLock)
+
+	if err := removeStaleSocket(d.cfg.SocketPath); err != nil {
+		return err
 	}
 
+	network := controlNetwork()
 	ln, err := net.Listen(network, d.cfg.SocketPath)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", d.cfg.SocketPath, err)
 	}
-	d.listener = ln
+	// Owner-only permissions for the filesystem-backed Unix endpoint.
 	if network == "unix" {
-		// Owner-only permissions.
 		if err := os.Chmod(d.cfg.SocketPath, 0700); err != nil {
 			ln.Close()
 			return fmt.Errorf("chmod socket: %w", err)
 		}
 	}
 
-	log.Printf("[daemon] listening on %s", d.cfg.SocketPath)
-
 	// Start continuous mDNS discovery in the background
 	discoverCtx, discoverCancel := context.WithCancel(ctx)
+	d.mu.Lock()
+	if d.shuttingDown {
+		d.mu.Unlock()
+		discoverCancel()
+		_ = ln.Close()
+		return nil
+	}
+	d.listener = ln
 	d.discoverCancel = discoverCancel
+	d.mu.Unlock()
+
+	log.Printf("[daemon] listening on %s", d.cfg.SocketPath)
 	go d.backgroundDiscover(discoverCtx)
 
 	go func() {
@@ -205,6 +369,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			d.mu.Lock()
+			shuttingDown := d.shuttingDown
+			d.mu.Unlock()
+			if shuttingDown {
+				return nil
+			}
 			log.Printf("[daemon] accept error: %v", err)
 			continue
 		}
@@ -215,32 +385,36 @@ func (d *Daemon) Run(ctx context.Context) error {
 // Shutdown stops any active sessions and cleans up the socket.
 func (d *Daemon) Shutdown() {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.discoverCancel != nil {
-		d.discoverCancel()
-		d.discoverCancel = nil
-	}
-	d.stopAllLocked()
-	if d.listener != nil {
-		d.listener.Close()
-	}
-	if controlNetwork() == "unix" {
-		os.Remove(d.cfg.SocketPath)
-	}
-}
+	d.shuttingDown = true
+	discoverCancel := d.discoverCancel
+	d.discoverCancel = nil
+	listener := d.listener
+	d.listener = nil
+	cleanup := d.detachAllLocked()
+	d.mu.Unlock()
 
-func controlNetwork() string {
-	if runtime.GOOS == "windows" {
-		return "tcp"
+	if discoverCancel != nil {
+		discoverCancel()
 	}
-	return "unix"
+	if listener != nil {
+		_ = listener.Close()
+	}
+	cleanup.run()
+
+	// Network handshakes, capture callbacks, and a concurrent control request's
+	// detached cleanup may still be unwinding. Do not let them run into the next
+	// test or process lifecycle.
+	d.streamWorkers.Wait()
+	if controlNetwork() == "unix" {
+		_ = os.Remove(d.cfg.SocketPath)
+	}
 }
 
 // backgroundDiscover continuously browses mDNS for AirPlay devices.
 // Each scan runs for 5 seconds. Devices not seen for >30 seconds are removed.
 func (d *Daemon) backgroundDiscover(ctx context.Context) {
 	const (
-		scanDuration = 12 * time.Second
+		scanDuration = 5 * time.Second
 		deviceTTL    = 30 * time.Second
 	)
 	log.Printf("[daemon] starting continuous mDNS discovery")
@@ -279,17 +453,18 @@ func (d *Daemon) backgroundDiscover(ctx context.Context) {
 			}
 			d.devices = devices
 			sort.Slice(d.devices, func(i, j int) bool {
-				iTV := strings.Contains(strings.ToLower(d.devices[i].Model), "appletv")
-				jTV := strings.Contains(strings.ToLower(d.devices[j].Model), "appletv")
-				if iTV != jTV {
-					return iTV
+				iAppleTV := isAppleTVDevice(d.devices[i])
+				jAppleTV := isAppleTVDevice(d.devices[j])
+				if iAppleTV != jAppleTV {
+					return iAppleTV
 				}
 				return d.devices[i].IP < d.devices[j].IP
 			})
-		} else {
-			log.Printf("[daemon] mDNS browse error: %v", err)
 		}
 		d.mu.Unlock()
+		if err != nil {
+			log.Printf("[daemon] mDNS browse error: %v", err)
+		}
 
 		// Next scan starts immediately (no extra wait — the 5s scan is the cadence)
 		if ctx.Err() != nil {
@@ -339,13 +514,12 @@ func (d *Daemon) handleRequest(req Request) Response {
 // overallState returns the aggregate daemon state based on active streams.
 // Must be called with d.mu held.
 func (d *Daemon) overallStateLocked() State {
-	if d.pendingTarget != "" {
-		return StatePINRequired
-	}
 	hasStreaming := false
 	hasConnecting := false
 	for _, s := range d.streams {
 		switch s.state {
+		case StatePINRequired:
+			return StatePINRequired
 		case StateStreaming:
 			hasStreaming = true
 		case StateConnecting:
@@ -368,14 +542,18 @@ func (d *Daemon) handleStatus() Response {
 }
 
 func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
+	if errMsg == "" {
+		errMsg = d.lastError
+	}
 	streams := make([]StreamInfo, 0, len(d.streams))
 	for _, s := range d.streams {
 		streams = append(streams, StreamInfo{
-			Device:     s.device,
-			DeviceIP:   s.deviceIP,
-			State:      s.state,
-			HasAudio:   s.session != nil && s.session.HasAudio(),
-			AudioMuted: s.audioMuted,
+			Device:         s.device,
+			DeviceIP:       s.deviceIP,
+			State:          s.state,
+			HasAudio:       s.session != nil && s.session.HasAudio(),
+			AudioMuted:     s.audioMuted,
+			CredentialKind: waitingCredentialKind(s),
 		})
 	}
 	// Sort for deterministic output
@@ -389,6 +567,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 	// backwards-compatibility with existing clients.
 	var device, deviceIP string
 	var hasAudio, audioMuted bool
+	var credentialKind CredentialKind
 	for _, s := range streams {
 		if s.State == StateStreaming {
 			device = s.Device
@@ -398,18 +577,58 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 			break
 		}
 	}
+	// The top-level fields can describe only one prompt. Select the first pending
+	// stream from the already sorted list for deterministic legacy behavior; all
+	// prompts remain available in Streams for multi-target control clients.
+	for _, stream := range streams {
+		if stream.State == StatePINRequired {
+			device = stream.Device
+			deviceIP = stream.DeviceIP
+			credentialKind = stream.CredentialKind
+			break
+		}
+	}
 
 	return Response{
-		OK:         ok,
-		State:      overall,
-		Device:     device,
-		DeviceIP:   deviceIP,
-		HasAudio:   hasAudio,
-		AudioMuted: audioMuted,
-		NeedsPIN:   overall == StatePINRequired,
-		Error:      errMsg,
-		Streams:    streams,
+		OK:              ok,
+		State:           overall,
+		Device:          device,
+		DeviceIP:        deviceIP,
+		HasAudio:        hasAudio,
+		AudioMuted:      audioMuted,
+		NeedsPIN:        credentialKind == CredentialKindPIN,
+		NeedsCredential: credentialKind != "",
+		CredentialKind:  credentialKind,
+		Error:           errMsg,
+		Streams:         streams,
 	}
+}
+
+func waitingCredentialKind(stream *activeStream) CredentialKind {
+	if stream == nil || stream.state != StatePINRequired {
+		return ""
+	}
+	if stream.credentialKind != "" {
+		return stream.credentialKind
+	}
+	// Entries created by older clients/tests predate CredentialKind and used the
+	// waiting state exclusively for an on-screen PIN.
+	return CredentialKindPIN
+}
+
+func requiredPairingCredentialKind(info *airplay.ReceiverInfo) CredentialKind {
+	switch info.RequiredPairingCredential() {
+	case airplay.PairingCredentialPIN:
+		return CredentialKindPIN
+	case airplay.PairingCredentialPassword:
+		return CredentialKindPassword
+	default:
+		return ""
+	}
+}
+
+func restoreSavedPairing(client *airplay.AirPlayClient, saved *airplay.SavedCredentials) error {
+	return client.RestorePairingCredentials(saved)
 }
 
 func (d *Daemon) handleDiscover() Response {
@@ -434,31 +653,49 @@ func (d *Daemon) handleDevices() Response {
 
 func (d *Daemon) handleConnect(req Request) Response {
 	d.mu.Lock()
+	if d.shuttingDown {
+		d.mu.Unlock()
+		return Response{OK: false, State: StateIdle, Error: "daemon is shutting down"}
+	}
 
-	// If we're waiting for a PIN and one was provided, resume that pending stream.
-	if d.pendingTarget != "" && req.Pin != "" {
-		target := d.pendingTarget
-		port := d.pendingPort
-		d.pendingTarget = ""
-		d.pendingPort = 0
-
-		// Register a connecting entry so state is visible
-		d.streams[target] = &activeStream{
-			deviceIP: target,
-			state:    StateConnecting,
+	// Resume a pending authentication session without replacing its AirPlay
+	// client. A target is required only when more than one receiver is waiting;
+	// targetless submissions remain compatible with older control clients.
+	if req.Pin != "" {
+		target := req.Target
+		if target == "" {
+			pending := d.pendingCredentialTargetsLocked()
+			switch len(pending) {
+			case 0:
+				state := d.overallStateLocked()
+				d.mu.Unlock()
+				return Response{OK: false, State: state, Error: "no device is waiting for a credential"}
+			case 1:
+				target = pending[0]
+			default:
+				state := d.overallStateLocked()
+				d.mu.Unlock()
+				return Response{OK: false, State: state, Error: "multiple devices are waiting for credentials; specify a target"}
+			}
 		}
-		d.mu.Unlock()
 
-		connCtx, cancel := context.WithCancel(context.Background())
-		d.mu.Lock()
-		d.streams[target].cancelFn = cancel
-		d.mu.Unlock()
-
-		go d.connectAndStream(connCtx, target, port, req.Pin)
-
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		return Response{OK: true, State: d.overallStateLocked(), Device: target}
+		if entry, ok := d.streams[target]; ok {
+			if entry.state != StatePINRequired || entry.credentialCh == nil {
+				state := d.overallStateLocked()
+				d.mu.Unlock()
+				return Response{OK: false, State: state, Error: "credential prompt is not ready for " + target}
+			}
+			entry.state = StateConnecting
+			entry.credentialKind = ""
+			d.clearLastErrorForTargetLocked(target)
+			// credentialCh is buffered and each pending session can be claimed only once.
+			entry.credentialCh <- req.Pin
+			state := d.overallStateLocked()
+			d.mu.Unlock()
+			return Response{OK: true, State: state, Device: target, DeviceIP: target}
+		}
+		// No existing entry means this is a new targeted connection with a
+		// credential supplied up front; continue into normal connection setup.
 	}
 
 	// Reject a duplicate connection to the same target.
@@ -476,8 +713,9 @@ func (d *Daemon) handleConnect(req Request) Response {
 	if target == "" {
 		target, port = d.pickFreeDeviceLocked(port)
 		if target == "" {
+			state := d.overallStateLocked()
 			d.mu.Unlock()
-			return Response{OK: false, State: d.overallStateLocked(), Error: "no available devices found"}
+			return Response{OK: false, State: state, Error: "no available devices found"}
 		}
 	}
 
@@ -494,33 +732,62 @@ func (d *Daemon) handleConnect(req Request) Response {
 		port = 7000
 	}
 
-	// Register a connecting placeholder.
-	entry := &activeStream{
-		deviceIP: target,
-		state:    StateConnecting,
-	}
-	d.streams[target] = entry
-	d.mu.Unlock()
-
+	// Create the context before publishing the entry so a concurrent disconnect
+	// can always cancel the connection goroutine.
 	connCtx, cancel := context.WithCancel(context.Background())
-	d.mu.Lock()
-	entry.cancelFn = cancel
+	entry := &activeStream{
+		deviceIP:     target,
+		state:        StateConnecting,
+		cancelFn:     cancel,
+		credentialCh: make(chan string, 1),
+	}
+	d.clearLastErrorForTargetLocked(target)
+	d.streams[target] = entry
+	// Add while holding d.mu, before Shutdown can mark the daemon closed and
+	// begin waiting. This is the WaitGroup's required Add-before-Wait ordering.
+	d.streamWorkers.Add(1)
 	d.mu.Unlock()
 
-	go d.connectAndStream(connCtx, target, port, req.Pin)
+	go func() {
+		defer d.streamWorkers.Done()
+		d.connectAndStream(connCtx, entry, target, port, req.Pin)
+	}()
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return Response{OK: true, State: d.overallStateLocked(), Device: target}
 }
 
+// pendingCredentialTargetsLocked returns pending target IPs in stable order.
+// Must be called with d.mu held.
+func (d *Daemon) pendingCredentialTargetsLocked() []string {
+	targets := make([]string, 0)
+	for target, stream := range d.streams {
+		if stream.state == StatePINRequired && stream.credentialCh != nil {
+			targets = append(targets, target)
+		}
+	}
+	sort.Strings(targets)
+	return targets
+}
+
+// clearLastErrorForTargetLocked acknowledges an error only when retrying the
+// receiver that produced it. Starting another target must not hide a concurrent
+// connection failure before a control client has a chance to report it.
+// Must be called with d.mu held.
+func (d *Daemon) clearLastErrorForTargetLocked(target string) {
+	if d.lastErrorTarget == "" || d.lastErrorTarget == target {
+		d.lastError = ""
+		d.lastErrorTarget = ""
+	}
+}
+
 // pickFreeDeviceLocked returns the first discovered device not already in d.streams.
 // Must be called with d.mu held.
 func (d *Daemon) pickFreeDeviceLocked(preferredPort int) (string, int) {
-	for _, preferAppleTV := range []bool{true, false} {
+	for _, appleTVOnly := range []bool{true, false} {
 		for _, dev := range d.devices {
-			isAppleTV := strings.Contains(strings.ToLower(dev.Model), "appletv")
-			if isAppleTV != preferAppleTV {
+			if isAppleTVDevice(dev) != appleTVOnly {
 				continue
 			}
 			if _, inUse := d.streams[dev.IP]; !inUse {
@@ -535,52 +802,94 @@ func (d *Daemon) pickFreeDeviceLocked(preferredPort int) (string, int) {
 	return "", 0
 }
 
-func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, pin string) {
-	// removeStream cleans up this stream's entry and tears down the shared broadcast
-	// if no other streams remain.
+func isAppleTVDevice(device airplay.AirPlayDevice) bool {
+	return strings.HasPrefix(device.Model, "AppleTV")
+}
+
+func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, target string, port int, suppliedCredential string) {
+	// removeStream cleans up this stream's entry and tears down its capture group
+	// if no other streams use that group.
 	removeStream := func(msg string) {
-		if msg != "" {
-			log.Printf("[daemon] %s", msg)
+		failure := msg
+		if failure != "" {
+			failure = fmt.Sprintf("%s: %s", target, failure)
 		}
 		d.mu.Lock()
-		defer d.mu.Unlock()
-		d.removeStreamLocked(target)
-	}
-	requestCredential := func(device string) {
-		d.mu.Lock()
-		delete(d.streams, target)
-		d.pendingTarget = target
-		d.pendingPort = port
+		// A user-requested disconnect removes the entry before closing its client.
+		// Ignore the resulting read/handshake error from that obsolete goroutine.
+		if d.streams[target] != entry {
+			d.mu.Unlock()
+			return
+		}
+		if failure != "" {
+			d.lastError = failure
+			d.lastErrorTarget = target
+		}
+		cleanup := d.detachStreamLocked(target)
 		d.mu.Unlock()
-		log.Printf("[daemon] pairing code or password required for %s - waiting for user input", device)
+
+		if failure != "" {
+			log.Printf("[daemon] %s", failure)
+		}
+		cleanup.run()
 	}
 
-	newClient := func() *airplay.AirPlayClient {
+	// A receiver-configured password and an on-screen pairing PIN travel through
+	// the same user-facing field. Pair-setup consumes it first; HTTP Digest may
+	// then require the same value during SETUP. Retain it across reconnects.
+	credential := d.cfg.Code
+	if suppliedCredential != "" {
+		credential = suppliedCredential
+	}
+	connectClient := func() (*airplay.AirPlayClient, *airplay.ReceiverInfo, error) {
+		var next *airplay.AirPlayClient
 		d.mu.Lock()
-		defer d.mu.Unlock()
 		for _, device := range d.devices {
 			if device.IP == target {
 				device.Port = port
-				return airplay.NewAirPlayClientForDevice(device)
+				next = airplay.NewAirPlayClientForDevice(device)
+				break
 			}
 		}
-		return airplay.NewAirPlayClient(target, port)
-	}
-	client := newClient()
-	client.SetPassword(pin)
-	if err := client.Connect(ctx); err != nil {
-		removeStream(fmt.Sprintf("connect to %s:%d failed: %v", target, port, err))
-		return
+		d.mu.Unlock()
+		if next == nil {
+			next = airplay.NewAirPlayClient(target, port)
+		}
+		next.SetPassword(credential)
+		if err := next.Connect(ctx); err != nil {
+			return nil, nil, err
+		}
+
+		// Publish the connected client immediately so disconnect/shutdown can
+		// interrupt GetInfo, pairing, or a pending credential wait.
+		d.mu.Lock()
+		if d.streams[target] != entry {
+			d.mu.Unlock()
+			_ = next.Close()
+			return nil, nil, context.Canceled
+		}
+		entry.client = next
+		d.mu.Unlock()
+
+		nextInfo, err := next.GetInfo()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		d.mu.Lock()
+		if d.streams[target] != entry {
+			d.mu.Unlock()
+			return nil, nil, context.Canceled
+		}
+		entry.device = nextInfo.Name
+		entry.deviceID = nextInfo.DeviceID
+		d.mu.Unlock()
+		return next, nextInfo, nil
 	}
 
-	info, err := client.GetInfo()
+	client, info, err := connectClient()
 	if err != nil {
-		client.Close()
-		if errors.Is(err, airplay.ErrCredentialsRequired) && pin == "" {
-			requestCredential(target)
-			return
-		}
-		removeStream(fmt.Sprintf("get info failed: %v", err))
+		removeStream(fmt.Sprintf("connect to %s:%d failed: %v", target, port, err))
 		return
 	}
 
@@ -590,24 +899,26 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 	if savedCreds != nil {
 		screenCastRestoreToken = savedCreds.RestoreToken
 	}
-	d.mu.Lock()
-	if entry, ok := d.streams[target]; ok {
-		entry.device = info.Name
-		entry.deviceID = deviceID
+
+	reconnect := func() error {
+		_ = client.Close()
+		next, nextInfo, err := connectClient()
+		if err != nil {
+			return err
+		}
+		client = next
+		info = nextInfo
+		deviceID = info.DeviceID
+		return nil
 	}
-	d.mu.Unlock()
 
 	log.Printf("[daemon] connected to %s (model: %s, deviceID: %s)", info.Name, info.Model, deviceID)
 
-	// Pairing
-	paired := false
-	if pin != "" {
-		if err := client.Pair(ctx, pin); err != nil {
-			client.Close()
-			removeStream(fmt.Sprintf("pairing failed: %v", err))
-			return
+	pairWithCredentialValue := func(value string) error {
+		credential = value
+		if err := client.Pair(ctx, value); err != nil {
+			return err
 		}
-		paired = true
 		if client.PairKeys != nil {
 			if err := d.credStore.SavePairing(deviceID, client.PairingID,
 				client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
@@ -617,180 +928,382 @@ func (d *Daemon) connectAndStream(ctx context.Context, target string, port int, 
 				log.Printf("[daemon] credentials saved for %s (deviceID: %s)", info.Name, deviceID)
 			}
 		}
+		return nil
 	}
 
-	if !paired && savedCreds != nil && savedCreds.HasPairingCredentials() {
-		verifyErr := client.RestorePairingCredentials(savedCreds)
+	waitForCredential := func(kind CredentialKind) (string, error) {
+		d.mu.Lock()
+		if d.streams[target] != entry {
+			d.mu.Unlock()
+			return "", context.Canceled
+		}
+		entry.credentialKind = kind
+		d.mu.Unlock()
+
+		// Do not expose the PIN prompt until the receiver has accepted the request
+		// to display one. Password mode deliberately never touches this endpoint.
+		if kind == CredentialKindPIN {
+			if err := client.StartPINDisplay(); err != nil {
+				d.mu.Lock()
+				if d.streams[target] == entry {
+					entry.credentialKind = ""
+				}
+				d.mu.Unlock()
+				return "", fmt.Errorf("start PIN display: %w", err)
+			}
+		}
+
+		d.mu.Lock()
+		if d.streams[target] != entry {
+			d.mu.Unlock()
+			return "", context.Canceled
+		}
+		entry.state = StatePINRequired
+		d.mu.Unlock()
+
+		log.Printf("[daemon] %s required for %s — waiting for user input", kind, info.Name)
+		select {
+		case value := <-entry.credentialCh:
+			return value, nil
+		case <-ctx.Done():
+			d.mu.Lock()
+			if d.streams[target] == entry {
+				entry.credentialKind = ""
+			}
+			d.mu.Unlock()
+			return "", ctx.Err()
+		}
+	}
+
+	// Pairing
+	paired := false
+	if savedCreds != nil && savedCreds.HasPairingCredentials() {
+		verifyErr := restoreSavedPairing(client, savedCreds)
 		if verifyErr == nil {
 			verifyErr = client.PairVerify(ctx)
 		}
 		if verifyErr != nil {
-			log.Printf("[daemon] pair-verify with saved creds failed: %v, trying transient pairing", verifyErr)
-			client.Close()
-			client = newClient()
-			client.SetPassword(pin)
-			if err := client.Connect(ctx); err != nil {
+			log.Printf("[daemon] pair-verify with saved creds failed: %v", verifyErr)
+			if err := reconnect(); err != nil {
 				removeStream(fmt.Sprintf("reconnect failed: %v", err))
 				return
-			}
-			if _, err := client.GetInfo(); err != nil {
-				removeStream(fmt.Sprintf("get info after reconnect failed: %v", err))
-				return
-			}
-			if err := client.Pair(ctx, ""); err != nil {
-				log.Printf("[daemon] transient pairing also failed: %v", err)
-			} else {
-				paired = true
-				log.Printf("[daemon] transient pairing succeeded for %s", info.Name)
 			}
 		} else {
 			paired = true
 			log.Printf("[daemon] pair-verify succeeded for %s", info.Name)
 		}
-	} else if !paired && savedCreds != nil {
+	} else if savedCreds != nil {
 		log.Printf("[daemon] saved credentials have no usable pair-verify keys, skipping")
 	}
 
 	if !paired {
-		if err := client.Pair(ctx, ""); err != nil {
-			log.Printf("[daemon] transient pairing failed: %v", err)
-			if airplay.IsHTTPStatusCode(err, 403) {
-				log.Printf("[daemon] %s", airplay.PairingAccessDeniedHint(info))
-			}
-			if err := client.StartPINDisplay(); err != nil {
-				log.Printf("[daemon] start PIN display failed: %v", err)
-				if airplay.IsHTTPStatusCode(err, 403) {
-					log.Printf("[daemon] %s", airplay.PairingAccessDeniedHint(info))
+		pairWithCredential := func(kind CredentialKind) error {
+			if credential == "" {
+				value, err := waitForCredential(kind)
+				if err != nil {
+					return fmt.Errorf("wait for %s: %w", kind, err)
 				}
+				credential = value
+				client.SetPassword(credential)
 			}
-			client.Close()
-			requestCredential(info.Name)
+			if err := pairWithCredentialValue(credential); err != nil {
+				return fmt.Errorf("%s pairing: %w", kind, err)
+			}
+			return nil
+		}
+
+		// Resolve the password/PIN status bits against the pairing generation.
+		// Legacy password receivers consume the password in SRP. Modern receivers
+		// keep it solely for Digest and still perform transient HAP pairing, even
+		// when the receiver also publishes the on-screen PIN bit.
+		switch requiredPairingCredentialKind(info) {
+		case CredentialKindPassword:
+			if err := pairWithCredential(CredentialKindPassword); err != nil {
+				removeStream(err.Error())
+				return
+			}
+		case CredentialKindPIN:
+			if err := pairWithCredential(CredentialKindPIN); err != nil {
+				removeStream(err.Error())
+				return
+			}
+		default:
+			if err := client.Pair(ctx, ""); err != nil {
+				log.Printf("[daemon] transient pairing failed: %v", err)
+				// A modern fixed password is an HTTP Digest credential, not an SRP
+				// secret. Do not turn a transient failure into an invalid full setup.
+				if info.RequiresPassword() {
+					removeStream(fmt.Sprintf("transient pairing failed for password-protected receiver: %v", err))
+					return
+				}
+				// A failed setup may leave pairing state attached to this socket. Start
+				// and finish the explicit PIN exchange on a fresh connection.
+				if err := reconnect(); err != nil {
+					removeStream(fmt.Sprintf("reconnect for credential pairing failed: %v", err))
+					return
+				}
+				if err := pairWithCredential(CredentialKindPIN); err != nil {
+					removeStream(err.Error())
+					return
+				}
+			} else {
+				log.Printf("[daemon] transient pairing succeeded for %s", info.Name)
+			}
+		}
+	}
+
+	// A configured playback password is independent from pair-verify. A saved or
+	// transient pairing may succeed without it, but SETUP will later issue a
+	// Digest challenge. Obtain the password once now and retain it for that retry.
+	if info.RequiresPassword() && credential == "" {
+		value, err := waitForCredential(CredentialKindPassword)
+		if err != nil {
+			removeStream(fmt.Sprintf("wait for password: %v", err))
 			return
 		}
-		paired = true
-		log.Printf("[daemon] transient pairing succeeded for %s", info.Name)
+		credential = value
+		client.SetPassword(credential)
 	}
-	_ = paired
 
 	// FairPlay setup
 	if err := client.FairPlaySetup(ctx); err != nil {
 		if !errors.Is(err, airplay.ErrFairPlayUnsupported) {
-			client.Close()
 			removeStream(fmt.Sprintf("FairPlay setup failed: %v", err))
 			return
 		}
 		log.Printf("[daemon] FairPlay SAP unsupported (%v); continuing with pair-verify DataStream setup", err)
 	}
 
-	streamCfg := airplay.StreamConfig{
-		FPS:       d.cfg.FPS,
-		Bitrate:   d.cfg.Bitrate,
-		PortMin:   d.cfg.PortMin,
-		PortMax:   d.cfg.PortMax,
-		NoEncrypt: d.cfg.NoEncrypt,
-		DirectKey: d.cfg.DirectKey,
-		NoAudio:   d.cfg.NoAudio,
-	}
-	var captureWidth, captureHeight int
-	session, err := client.SetupMirrorWithVideoPreparation(ctx, streamCfg, func(width, height int) error {
-		captureWidth, captureHeight = width, height
-		return nil
-	})
-	if err != nil {
-		client.Close()
-		if errors.Is(err, airplay.ErrCredentialsRequired) && pin == "" {
-			requestCredential(info.Name)
-			return
+	streamCfg := d.mirrorStreamConfig()
+	streamCfg.AutomaticHEVCAvailable = airplay.AutomaticHEVCAvailable(d.cfg.HWAccel)
+	var broadcast *airplay.BroadcastCapture
+	selectedCaptureKey := videoCaptureKey{maxWidth: -1, maxHeight: -1}
+	prepareVideo := func(width, height int, codec airplay.VideoCodec) (airplay.VideoPreparationResult, error) {
+		key := normalizedVideoCaptureKey(width, height, codec)
+		if broadcast != nil {
+			if key.codec == selectedCaptureKey.codec {
+				if key.maxWidth != selectedCaptureKey.maxWidth || key.maxHeight != selectedCaptureKey.maxHeight {
+					log.Printf("[daemon] receiver updated the %s canvas to %dx%d after capture started; keeping %dx%d for this session",
+						key.codec, key.maxWidth, key.maxHeight, selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight)
+				}
+				return airplay.VideoPreparationResult{}, nil
+			}
+			return airplay.VideoPreparationResult{}, fmt.Errorf("receiver changed video from %s %dx%d to %s %dx%d during setup",
+				selectedCaptureKey.codec, selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight,
+				key.codec, key.maxWidth, key.maxHeight)
 		}
+		resolved, startErr := d.getOrStartCaptureGroup(entry, screenCastRestoreToken, deviceID, width, height, codec)
+		if startErr != nil {
+			return airplay.VideoPreparationResult{}, startErr
+		}
+		broadcast = resolved
+		selectedCaptureKey = key
+		return airplay.VideoPreparationResult{}, nil
+	}
+
+	session, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)
+	err = retryMirrorSetupAfterDigestChallenge(
+		err,
+		func() (string, error) { return waitForCredential(CredentialKindPassword) },
+		func(value string) {
+			credential = value
+			client.SetPassword(value)
+		},
+		func() error {
+			if selectedCaptureKey.codec != "" {
+				streamCfg.VideoCodec = selectedCaptureKey.codec
+			}
+			var setupErr error
+			session, setupErr = client.SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)
+			return setupErr
+		},
+	)
+	if err != nil {
 		removeStream(fmt.Sprintf("mirror setup failed: %v", err))
 		return
 	}
-
-	// Obtain or reuse the shared screen capture + broadcast fan-out.
-	sink, err := d.getOrStartBroadcastLocked(screenCastRestoreToken, deviceID, captureWidth, captureHeight)
-	if err != nil {
-		session.Close()
-		client.Close()
-		removeStream(fmt.Sprintf("capture failed: %v", err))
+	if broadcast == nil {
+		_ = session.Close()
+		removeStream("mirror setup completed without preparing video capture")
 		return
 	}
 
 	d.mu.Lock()
-	entry, ok := d.streams[target]
-	if !ok {
+	current, ok := d.streams[target]
+	if !ok || current != entry {
 		// Stream was cancelled while we were setting up
 		d.mu.Unlock()
-		sink.Close()
-		session.Close()
-		client.Close()
+		_ = session.Close()
 		d.mu.Lock()
-		d.maybeStopBroadcastLocked()
+		cleanup := d.detachCaptureGroupIfUnusedLocked(entry.captureGroup)
 		d.mu.Unlock()
+		cleanup.run()
 		return
 	}
-	entry.state = StateStreaming
-	entry.session = session
-	entry.client = client
-	entry.sink = sink
-	entry.audioMuted = false
+	// Attach only after SETUP succeeds. This avoids buffering encoded data for a
+	// receiver which is still pairing, prompting, or negotiating its media ports.
+	sink := broadcast.AddSink()
+	current.state = StateStreaming
+	current.session = session
+	current.client = client
+	current.sink = sink
+	current.audioMuted = false
 	d.mu.Unlock()
 
-	log.Printf("[daemon] streaming to %s (%s)", info.Name, target)
+	log.Printf("[daemon] streaming to %s (%s) at %dx%d using %s",
+		info.Name, target, selectedCaptureKey.maxWidth, selectedCaptureKey.maxHeight, selectedCaptureKey.codec)
+	videoDone := make(chan error, 1)
+	go func() {
+		videoDone <- session.StreamFrames(ctx, sink.AsCapture(), 0)
+	}()
 
-	// Start audio for this stream independently.
+	// Start audio for this stream independently, but retain a completion channel
+	// so the stream worker does not outlive daemon shutdown.
+	var audioCapture *airplay.AudioCapture
+	var audioDone chan error
 	if !d.cfg.NoAudio && session.HasAudio() {
-		audioCapture, audioErr := airplay.StartAudioCapture(ctx, d.cfg.TestMode, session.AudioCodec())
+		var audioErr error
+		audioCapture, audioErr = airplay.StartAudioCapture(ctx, d.cfg.TestMode, session.AudioCodec())
 		if audioErr != nil {
 			log.Printf("[daemon] audio capture failed: %v (continuing without audio)", audioErr)
 		} else {
-			defer audioCapture.Stop()
+			audioDone = make(chan error, 1)
 			go func() {
-				if aerr := session.StreamAudio(ctx, audioCapture, session.AudioStream()); aerr != nil && ctx.Err() == nil {
+				aerr := session.StreamAudio(ctx, audioCapture, session.AudioStream())
+				if aerr != nil && ctx.Err() == nil {
 					log.Printf("[daemon] audio streaming error: %v", aerr)
 				}
+				audioDone <- aerr
 			}()
 			log.Printf("[daemon] audio capture started for %s", target)
 		}
 	}
 
-	streamErr := session.StreamFrames(ctx, sink.AsCapture(), 0)
+	streamErr := <-videoDone
 	if streamErr != nil && ctx.Err() == nil {
 		log.Printf("[daemon] stream error for %s: %v", target, streamErr)
 	}
 
-	// Cleanup this stream.
-	sink.Close()
-	session.Close()
-	client.Close()
-
+	// Atomically remove the stream before any potentially blocking teardown.
+	// A concurrent disconnect or shutdown which won the detach race owns those
+	// resources instead, and the idempotent local audio cleanup can still finish.
 	d.mu.Lock()
-	d.removeStreamLocked(target)
+	cleanup := daemonCleanup{}
+	if d.streams[target] == entry {
+		cleanup = d.detachStreamLocked(target)
+	}
 	d.mu.Unlock()
+	cleanup.run()
+
+	if audioCapture != nil {
+		audioCapture.Stop()
+	}
+	if audioDone != nil {
+		<-audioDone
+	}
 
 	log.Printf("[daemon] stream ended for %s", target)
 }
 
-// getOrStartBroadcastLocked ensures a shared BroadcastCapture is running and
-// returns a new sink registered with it. If no capture is running, it starts one.
-// Must NOT be called with d.mu held.
-func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxWidth, maxHeight int) (*airplay.BroadcastSink, error) {
-	d.mu.Lock()
-	bc := d.broadcast
-	d.mu.Unlock()
-
-	if bc != nil {
-		// Capture already running — add a new sink.
-		sink := bc.AddSink()
-		return sink, nil
+// retryMirrorSetupAfterDigestChallenge handles receivers which reveal a
+// configured playback password only when SETUP is attempted. It deliberately
+// retries once on the existing paired/FairPlay connection: a rejected Digest
+// request has not created receiver-side media state, and reconnecting would
+// discard both the cached challenge and the completed handshakes.
+func retryMirrorSetupAfterDigestChallenge(
+	setupErr error,
+	waitForPassword func() (string, error),
+	setPassword func(string),
+	retrySetup func() error,
+) error {
+	if !errors.Is(setupErr, airplay.ErrCredentialsRequired) {
+		return setupErr
 	}
 
-	// Start a fresh screen capture.
+	password, err := waitForPassword()
+	if err != nil {
+		return fmt.Errorf("wait for password: %w", err)
+	}
+	setPassword(password)
+
+	return retrySetup()
+}
+
+// normalizedVideoCaptureKey matches the even canvas which the capture pipeline
+// will actually encode. Invalid or incomplete dimensions share the unconstrained
+// group instead of accidentally constraining one axis only.
+func normalizedVideoCaptureKey(maxW, maxH int, codecs ...airplay.VideoCodec) videoCaptureKey {
+	codec := airplay.VideoCodecH264
+	if len(codecs) > 0 && codecs[0] != "" {
+		codec = codecs[0]
+	}
+	if maxW <= 0 || maxH <= 0 {
+		return videoCaptureKey{codec: codec}
+	}
+	return videoCaptureKey{maxWidth: maxW &^ 1, maxHeight: maxH &^ 1, codec: codec}
+}
+
+// getOrStartCaptureGroup returns the capture group matching this stream's
+// requested encoded canvas. It deliberately does not add a sink: callers
+// attach only after SETUP succeeds, when they can immediately consume it without
+// stalling established streams. Must NOT be called with d.mu held.
+func (d *Daemon) getOrStartCaptureGroup(entry *activeStream, restoreToken, deviceID string, maxW, maxH int, codecs ...airplay.VideoCodec) (*airplay.BroadcastCapture, error) {
+	// Serialize capture startup so two targets cannot race the group map and so
+	// Wayland portal requests are presented one at a time.
+	d.captureStartMu.Lock()
+	defer d.captureStartMu.Unlock()
+
+	codec := d.cfg.VideoCodec
+	if len(codecs) > 0 {
+		codec = codecs[0]
+	}
+	if codec == "" {
+		codec = airplay.VideoCodecH264
+	}
+	if codec == airplay.VideoCodecAuto {
+		if len(codecs) > 0 {
+			return nil, fmt.Errorf("automatic video codec must be resolved before capture startup")
+		}
+		// This helper has no receiver snapshot from which to resolve auto; retain
+		// its historical H.264 behavior. Production passes a concrete codec.
+		codec = airplay.VideoCodecH264
+	}
+	key := normalizedVideoCaptureKey(maxW, maxH, codec)
+	d.mu.Lock()
+	if d.streams[entry.deviceIP] != entry {
+		d.mu.Unlock()
+		return nil, context.Canceled
+	}
+	if d.captureGroups == nil {
+		d.captureGroups = make(map[videoCaptureKey]*videoCaptureGroup)
+	}
+	if group := d.captureGroups[key]; group != nil {
+		entry.captureGroup = group
+		broadcast := group.broadcast
+		d.mu.Unlock()
+		if broadcast == nil {
+			return nil, fmt.Errorf("capture group %dx%d has no broadcast", key.maxWidth, key.maxHeight)
+		}
+		return broadcast, nil
+	}
+
+	// Publish the group and cancellation hook before entering the display portal
+	// or launching GStreamer. A targeted disconnect can then cancel an orphaned
+	// startup without affecting captures used by other canvas groups.
+	captureCtx, captureCancel := context.WithCancel(context.Background())
+	group := &videoCaptureGroup{key: key, cancel: captureCancel}
+	d.captureGroups[key] = group
+	entry.captureGroup = group
+	d.mu.Unlock()
+
 	capCfg := airplay.CaptureConfig{
 		FPS:          d.cfg.FPS,
 		Bitrate:      d.cfg.Bitrate,
 		HWAccel:      d.cfg.HWAccel,
-		MaxWidth:     maxWidth,
-		MaxHeight:    maxHeight,
+		VideoCodec:   codec,
+		MaxWidth:     key.maxWidth,
+		MaxHeight:    key.maxHeight,
+		ShowCursor:   d.cfg.ShowCursor,
 		RestoreToken: restoreToken,
 	}
 	if deviceID != "" {
@@ -803,7 +1316,6 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxWid
 		capture *airplay.ScreenCapture
 		err     error
 	)
-	captureCtx, captureCancel := context.WithCancel(context.Background())
 	if d.cfg.TestMode {
 		capture, err = airplay.StartTestCapture(captureCtx, capCfg)
 	} else {
@@ -811,103 +1323,189 @@ func (d *Daemon) getOrStartBroadcastLocked(restoreToken, deviceID string, maxWid
 	}
 	if err != nil {
 		captureCancel()
+		d.mu.Lock()
+		if d.captureGroups[key] == group {
+			delete(d.captureGroups, key)
+		}
+		if entry.captureGroup == group {
+			entry.captureGroup = nil
+		}
+		d.mu.Unlock()
 		return nil, err
 	}
 
-	newBC := airplay.NewBroadcastCapture(capture)
-	sink := newBC.AddSink()
-
+	newBC := airplay.NewBroadcastCaptureWithFrameRate(capture, d.cfg.FPS)
 	d.mu.Lock()
-	// Double-check: another goroutine might have started capture concurrently.
-	if d.broadcast != nil {
+	if d.captureGroups[key] != group || d.streams[entry.deviceIP] != entry || entry.captureGroup != group {
 		d.mu.Unlock()
-		// Discard the one we just started and use the existing one.
 		captureCancel()
 		capture.Stop()
-		return d.broadcast.AddSink(), nil
+		return nil, context.Canceled
 	}
-	d.broadcast = newBC
-	d.capture = capture
-	d.captureCancel = captureCancel
+	group.broadcast = newBC
+	group.capture = capture
+	// Add while holding d.mu so Shutdown cannot begin waiting between publishing
+	// the capture and registering its completion worker.
+	d.streamWorkers.Add(1)
 	d.mu.Unlock()
 
 	go func() {
-		if runErr := newBC.Run(); runErr != nil && runErr.Error() != "EOF" {
-			log.Printf("[daemon] broadcast capture error: %v", runErr)
-		}
-		// When the capture ends, stop all active streams.
-		d.mu.Lock()
-		d.stopAllLocked()
-		d.mu.Unlock()
+		defer d.streamWorkers.Done()
+		d.finishCaptureGroup(group, newBC, newBC.Run())
 	}()
 
-	return sink, nil
+	return newBC, nil
 }
 
-// removeStreamLocked removes a single stream entry and tears down the shared
-// capture if no other streams are left. Must be called with d.mu held.
-func (d *Daemon) removeStreamLocked(target string) {
+// detachStreamLocked removes a single stream and transfers ownership of its
+// resources, plus an unused final capture group, to a cleanup plan. The caller
+// must unlock d.mu before running the plan.
+func (d *Daemon) detachStreamLocked(target string) daemonCleanup {
+	cleanup := daemonCleanup{}
 	entry, ok := d.streams[target]
 	if !ok {
-		return
+		return cleanup
 	}
-	if entry.cancelFn != nil {
-		entry.cancelFn()
-	}
+	group := entry.captureGroup
 	delete(d.streams, target)
-	d.maybeStopBroadcastLocked()
+	cleanup.addStream(entry)
+	cleanup.merge(d.detachCaptureGroupIfUnusedLocked(group))
+	return cleanup
 }
 
-// maybeStopBroadcastLocked stops the shared capture if no active streams remain.
-// Must be called with d.mu held.
-func (d *Daemon) maybeStopBroadcastLocked() {
-	if len(d.streams) > 0 {
+// captureGroupInUseLocked reports whether a connecting or streaming receiver
+// still owns a reference to group. Must be called with d.mu held.
+func (d *Daemon) captureGroupInUseLocked(group *videoCaptureGroup) bool {
+	if group == nil {
+		return false
+	}
+	for _, entry := range d.streams {
+		if entry.captureGroup == group {
+			return true
+		}
+	}
+	return false
+}
+
+func (cleanup *daemonCleanup) merge(other daemonCleanup) {
+	cleanup.cancels = append(cleanup.cancels, other.cancels...)
+	cleanup.sinks = append(cleanup.sinks, other.sinks...)
+	cleanup.sessions = append(cleanup.sessions, other.sessions...)
+	cleanup.clients = append(cleanup.clients, other.clients...)
+	cleanup.captures = append(cleanup.captures, other.captures...)
+}
+
+func (cleanup *daemonCleanup) empty() bool {
+	return len(cleanup.cancels) == 0 && len(cleanup.sinks) == 0 &&
+		len(cleanup.sessions) == 0 && len(cleanup.clients) == 0 &&
+		len(cleanup.captures) == 0
+}
+
+// detachCaptureGroupIfUnusedLocked transfers an encoder group to a cleanup plan
+// when its final receiver leaves. The caller must run the plan after unlocking.
+func (d *Daemon) detachCaptureGroupIfUnusedLocked(group *videoCaptureGroup) daemonCleanup {
+	if group == nil || d.captureGroupInUseLocked(group) {
+		return daemonCleanup{}
+	}
+	return d.detachCaptureGroupLocked(group)
+}
+
+// detachCaptureGroupLocked removes one capture generation before transferring
+// its resources. Deleting first makes the BroadcastCapture completion callback
+// recognize an intentional stop and leave any replacement generation alone.
+func (d *Daemon) detachCaptureGroupLocked(group *videoCaptureGroup) daemonCleanup {
+	cleanup := daemonCleanup{}
+	if group == nil {
+		return cleanup
+	}
+	if d.captureGroups[group.key] != group {
+		return cleanup
+	}
+	delete(d.captureGroups, group.key)
+	cleanup.addCaptureGroup(group)
+	return cleanup
+}
+
+// detachCaptureGroupStreamsLocked removes only streams backed by group and
+// transfers all associated resources. The caller must run cleanup after unlock.
+func (d *Daemon) detachCaptureGroupStreamsLocked(group *videoCaptureGroup) daemonCleanup {
+	cleanup := daemonCleanup{}
+	for target, entry := range d.streams {
+		if entry.captureGroup != group {
+			continue
+		}
+		delete(d.streams, target)
+		cleanup.addStream(entry)
+	}
+	cleanup.merge(d.detachCaptureGroupLocked(group))
+	return cleanup
+}
+
+// finishCaptureGroup handles both EOF and failures from BroadcastCapture.Run.
+// State is detached under d.mu and all cancellation and I/O happens afterwards.
+func (d *Daemon) finishCaptureGroup(group *videoCaptureGroup, broadcast *airplay.BroadcastCapture, runErr error) {
+	unexpected := runErr != nil && !errors.Is(runErr, io.EOF)
+	d.mu.Lock()
+	// An intentionally stopped group can finish after another capture with the
+	// same dimensions has already started. Never tear down that replacement.
+	if d.captureGroups[group.key] != group || group.broadcast != broadcast {
+		d.mu.Unlock()
 		return
 	}
-	if d.captureCancel != nil {
-		d.captureCancel()
-		d.captureCancel = nil
+	inUse := d.captureGroupInUseLocked(group)
+	if unexpected && inUse {
+		d.lastError = fmt.Sprintf("%dx%d capture failed: %v", group.key.maxWidth, group.key.maxHeight, runErr)
+		d.lastErrorTarget = ""
 	}
-	if d.capture != nil {
-		d.capture.Stop()
-		d.capture = nil
+	// A capture failure affects only receivers consuming this encoded canvas;
+	// other resolution groups continue streaming.
+	cleanup := d.detachCaptureGroupStreamsLocked(group)
+	d.mu.Unlock()
+
+	if unexpected {
+		log.Printf("[daemon] %dx%d capture error: %v", group.key.maxWidth, group.key.maxHeight, runErr)
 	}
-	d.broadcast = nil
+	cleanup.run()
 }
 
 func (d *Daemon) handleDisconnect(req Request) Response {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	// If a target is specified, disconnect only that stream.
 	if req.Target != "" {
-		entry, ok := d.streams[req.Target]
+		_, ok := d.streams[req.Target]
 		if !ok {
-			return Response{OK: false, State: d.overallStateLocked(), Error: "no active stream to " + req.Target}
+			response := Response{OK: false, State: d.overallStateLocked(), Error: "no active stream to " + req.Target}
+			d.mu.Unlock()
+			return response
 		}
-		if entry.cancelFn != nil {
-			entry.cancelFn()
+		cleanup := d.detachStreamLocked(req.Target)
+		response := Response{OK: true, State: d.overallStateLocked()}
+		// Shutdown waits for every cleanup which was detached before it marked the
+		// daemon closed. Register while holding d.mu to preserve Add-before-Wait.
+		tracked := !cleanup.empty()
+		if tracked {
+			d.streamWorkers.Add(1)
 		}
-		if entry.sink != nil {
-			entry.sink.Close()
+		d.mu.Unlock()
+		cleanup.run()
+		if tracked {
+			d.streamWorkers.Done()
 		}
-		if entry.session != nil {
-			entry.session.Close()
-		}
-		if entry.client != nil {
-			entry.client.Close()
-		}
-		delete(d.streams, req.Target)
-		d.maybeStopBroadcastLocked()
-		return Response{OK: true, State: d.overallStateLocked()}
+		return response
 	}
 
-	// Also clear any pending PIN state.
-	d.pendingTarget = ""
-	d.pendingPort = 0
-
 	// Disconnect all.
-	d.stopAllLocked()
+	cleanup := d.detachAllLocked()
+	tracked := !cleanup.empty()
+	if tracked {
+		d.streamWorkers.Add(1)
+	}
+	d.mu.Unlock()
+	cleanup.run()
+	if tracked {
+		d.streamWorkers.Done()
+	}
 	return Response{OK: true, State: StateIdle}
 }
 
@@ -918,8 +1516,9 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 	if req.Target != "" {
 		entry, ok := d.streams[req.Target]
 		if !ok {
+			state := d.overallStateLocked()
 			d.mu.Unlock()
-			return Response{OK: false, State: d.overallStateLocked(), Error: "no active stream to " + req.Target}
+			return Response{OK: false, State: state, Error: "no active stream to " + req.Target}
 		}
 		targets = []*activeStream{entry}
 	} else {
@@ -964,33 +1563,21 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 	return d.statusResponseLocked(true, "")
 }
 
-// stopAllLocked stops all active streams and tears down the capture.
-// Must be called with d.mu held.
-func (d *Daemon) stopAllLocked() {
+// detachAllLocked removes every active stream and capture group atomically and
+// returns their resources for cleanup after d.mu is released.
+func (d *Daemon) detachAllLocked() daemonCleanup {
+	cleanup := daemonCleanup{}
 	for target, entry := range d.streams {
-		if entry.cancelFn != nil {
-			entry.cancelFn()
-		}
-		if entry.sink != nil {
-			entry.sink.Close()
-		}
-		if entry.session != nil {
-			entry.session.Close()
-		}
-		if entry.client != nil {
-			entry.client.Close()
-		}
 		delete(d.streams, target)
+		cleanup.addStream(entry)
 	}
-	if d.capture != nil {
-		d.capture.Stop()
-		d.capture = nil
+	// Entries no longer reference their groups, so every published group can be
+	// detached without repeatedly scanning d.streams.
+	for _, group := range d.captureGroups {
+		cleanup.addCaptureGroup(group)
 	}
-	if d.captureCancel != nil {
-		d.captureCancel()
-		d.captureCancel = nil
-	}
-	d.broadcast = nil
+	clear(d.captureGroups)
+	return cleanup
 }
 
 func toDeviceInfos(devices []airplay.AirPlayDevice) []DeviceInfo {

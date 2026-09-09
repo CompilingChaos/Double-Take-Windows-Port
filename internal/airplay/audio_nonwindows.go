@@ -5,6 +5,7 @@ package airplay
 import (
 	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 )
@@ -54,15 +55,13 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 		}
 	}
 
-	gstArgs := []string{"--quiet"}
-	gstArgs = append(gstArgs, srcArgs...)
-	gstArgs = append(gstArgs,
-		"!", "audioconvert",
-		"!", "audioresample",
-		"!", "audio/x-raw,rate=44100,channels=2,format=S16LE",
-		"!", "queue", "max-size-buffers=2", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
-		"!", "fdsink", "fd=1", "sync=false", "async=false",
-	)
+	timestamped := supportsTimestampedAudioOutput()
+	if !timestamped {
+		audioTimestampFallbackWarning.Do(func() {
+			log.Printf("[AUDIO] warning: GStreamer RTP/ONVIF timestamp elements are unavailable; using read-time audio clock fallback")
+		})
+	}
+	gstArgs := audioCapturePipelineArgs(srcArgs, codec, timestamped)
 	dbg("[AUDIO] PCM capture pipeline: gst-launch-1.0 %s", strings.Join(gstArgs, " "))
 
 	gstCmd := exec.CommandContext(captureCtx, "gst-launch-1.0", gstArgs...)
@@ -89,6 +88,9 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 		}
 	}
 	ac.pcmPipe = gstStdout
+	if timestamped {
+		ac.pcmFrames = newRTPL16PCMFrameReader(gstStdout)
+	}
 	go func() {
 		ac.waitErr = gstCmd.Wait()
 		close(ac.waitCh)

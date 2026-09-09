@@ -18,11 +18,13 @@ import (
 
 // CaptureConfig holds screen capture settings.
 type CaptureConfig struct {
-	FPS       int
-	Bitrate   int    // Video bitrate in kbps (0 = auto)
-	HWAccel   string // "auto", "nvenc", "none"
-	MaxWidth  int    // receiver-advertised encoded canvas; zero keeps native size
-	MaxHeight int
+	FPS        int
+	Bitrate    int    // Video bitrate in kbps (0 = auto)
+	HWAccel    string // "auto", "nvenc", "none"
+	VideoCodec VideoCodec
+	MaxWidth   int // receiver-advertised encoded canvas; zero keeps native size
+	MaxHeight  int
+	ShowCursor bool
 
 	RestoreToken     string
 	SaveRestoreToken func(string) error
@@ -44,6 +46,7 @@ type ScreenCapture struct {
 	cancel   context.CancelFunc
 	waitCh   chan struct{}
 	waitErr  error
+	frames   videoAccessUnitReader
 	stopOnce sync.Once
 }
 
@@ -68,7 +71,7 @@ func startFFmpegCapture(ctx context.Context, cfg CaptureConfig, ffmpegPath strin
 		"-hide_banner",
 		"-loglevel", "warning",
 		"-f", "gdigrab",
-		"-draw_mouse", "1",
+		"-draw_mouse", strconv.FormatBool(cfg.ShowCursor),
 		"-framerate", fmt.Sprintf("%d", fps),
 		"-i", "desktop",
 		"-an",
@@ -76,9 +79,13 @@ func startFFmpegCapture(ctx context.Context, cfg CaptureConfig, ffmpegPath strin
 	if scale := ffmpegReceiverScaleFilter(cfg); scale != "" {
 		ffArgs = append(ffArgs, "-vf", scale)
 	}
-	ffArgs = append(ffArgs, ffmpegEncoder(cfg)...)
+	encoderArgs, pixelFormat, muxer, err := ffmpegVideoEncoder(cfg, ffmpegPath)
+	if err != nil {
+		return nil, err
+	}
+	ffArgs = append(ffArgs, encoderArgs...)
 	ffArgs = append(ffArgs,
-		"-pix_fmt", "yuv420p",
+		"-pix_fmt", pixelFormat,
 		"-b:v", fmt.Sprintf("%dk", bitrate),
 		"-maxrate", fmt.Sprintf("%dk", bitrate+bitrate/4),
 		"-bufsize", fmt.Sprintf("%dk", vbvBufferKbit(bitrate, fps)),
@@ -87,10 +94,46 @@ func startFFmpegCapture(ctx context.Context, cfg CaptureConfig, ffmpegPath strin
 		"-fflags", "nobuffer",
 		"-flags", "low_delay",
 		"-flush_packets", "1",
-		"-f", "h264",
+		"-f", muxer,
 		"pipe:1",
 	)
-	return startFFmpegProcess(ctx, ffmpegPath, ffArgs, "FFMPEG")
+	capture, err := startFFmpegProcess(ctx, ffmpegPath, ffArgs, "FFMPEG")
+	if err == nil && normalizeVideoCodec(cfg.VideoCodec) == VideoCodecHEVC {
+		capture.frames = newAnnexBHEVCAccessUnitReader(capture.stdout)
+	}
+	return capture, err
+}
+
+func ffmpegVideoEncoder(cfg CaptureConfig, ffmpegPath string) (args []string, pixelFormat, muxer string, err error) {
+	if normalizeVideoCodec(cfg.VideoCodec) != VideoCodecHEVC {
+		return ffmpegEncoder(cfg), "yuv420p", "h264", nil
+	}
+
+	hwaccel := strings.ToLower(cfg.HWAccel)
+	if hwaccel != "none" && ffmpegHEVCHardwareAvailable(ffmpegPath) {
+		log.Printf("[CAPTURE] using FFmpeg NVENC HEVC Main10 hardware encoding (hevc_nvenc)")
+		return []string{
+			"-c:v", "hevc_nvenc",
+			"-preset", "p4",
+			"-tune", "ull",
+			"-rc", "cbr",
+			"-zerolatency", "1",
+			"-profile:v", "main10",
+			"-aud", "1",
+			"-repeat_headers", "1",
+		}, "p010le", "hevc", nil
+	}
+	if hwaccel == "nvenc" {
+		return nil, "", "", fmt.Errorf("the requested FFmpeg hevc_nvenc encoder is unavailable or failed its hardware probe")
+	}
+	log.Printf("[CAPTURE] using FFmpeg software HEVC Main10 encoding (libx265)")
+	return []string{
+		"-c:v", "libx265",
+		"-preset", "ultrafast",
+		"-tune", "zerolatency",
+		"-profile:v", "main10",
+		"-x265-params", "repeat-headers=1:aud=1:scenecut=0:bframes=0",
+	}, "yuv420p10le", "hevc", nil
 }
 
 func ffmpegEncoder(cfg CaptureConfig) []string {
@@ -117,6 +160,71 @@ func ffmpegEncoder(cfg CaptureConfig) []string {
 	}
 }
 
+var ffmpegEncoderProbes sync.Map
+var ffmpegHEVCHardwareProbes sync.Map
+
+func ffmpegSupportsEncoder(ffmpegPath, encoder string) bool {
+	key := ffmpegPath + "\x00" + encoder
+	if cached, ok := ffmpegEncoderProbes.Load(key); ok {
+		return cached.(bool)
+	}
+	out, err := exec.Command(ffmpegPath, "-hide_banner", "-encoders").Output()
+	found := false
+	if err == nil {
+		for _, field := range strings.Fields(string(out)) {
+			if field == encoder {
+				found = true
+				break
+			}
+		}
+	}
+	ffmpegEncoderProbes.Store(key, found)
+	return found
+}
+
+func ffmpegHEVCHardwareAvailable(ffmpegPath string) bool {
+	if cached, ok := ffmpegHEVCHardwareProbes.Load(ffmpegPath); ok {
+		return cached.(bool)
+	}
+	available := false
+	if ffmpegSupportsEncoder(ffmpegPath, "hevc_nvenc") {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, ffmpegPath,
+			"-hide_banner", "-loglevel", "error",
+			"-f", "lavfi", "-i", "color=size=64x64:rate=1",
+			"-frames:v", "1", "-c:v", "hevc_nvenc", "-preset", "p4",
+			"-profile:v", "main10", "-pix_fmt", "p010le", "-f", "null", "-")
+		available = cmd.Run() == nil
+	}
+	ffmpegHEVCHardwareProbes.Store(ffmpegPath, available)
+	return available
+}
+
+// AutomaticHEVCAvailable reports whether Windows has the hardware HEVC path
+// used for automatic high-resolution selection. Explicit HEVC may use libx265.
+func AutomaticHEVCAvailable(hwaccel string) bool {
+	method := strings.ToLower(strings.TrimSpace(hwaccel))
+	if method == "none" || (method != "" && method != "auto" && method != "nvenc") {
+		return false
+	}
+	ffmpegPath, err := ffmpegExecutable()
+	if err != nil {
+		return false
+	}
+	return ffmpegHEVCHardwareAvailable(ffmpegPath)
+}
+
+// ValidateHWAccel checks a Windows capture acceleration value.
+func ValidateHWAccel(method string) error {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "", "auto", "nvenc", "none":
+		return nil
+	default:
+		return fmt.Errorf("unknown hardware acceleration %q (want auto, nvenc, or none)", method)
+	}
+}
+
 func (sc *ScreenCapture) Read(buf []byte) (int, error) {
 	select {
 	case <-sc.waitCh:
@@ -127,6 +235,13 @@ func (sc *ScreenCapture) Read(buf []byte) (int, error) {
 	default:
 	}
 	return sc.stdout.Read(buf)
+}
+
+func (sc *ScreenCapture) ReadVideoAccessUnit() (VideoAccessUnit, error) {
+	if sc == nil || sc.frames == nil {
+		return VideoAccessUnit{}, fmt.Errorf("timestamped video capture is unavailable")
+	}
+	return sc.frames.ReadVideoAccessUnit()
 }
 
 func (sc *ScreenCapture) Stop() {
@@ -178,21 +293,26 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 	if scale := ffmpegReceiverScaleFilter(cfg); scale != "" {
 		ffArgs = append(ffArgs, "-vf", scale)
 	}
+	encoderArgs, pixelFormat, muxer, err := ffmpegVideoEncoder(cfg, ffmpegPath)
+	if err != nil {
+		return nil, err
+	}
+	ffArgs = append(ffArgs, encoderArgs...)
 	ffArgs = append(ffArgs,
-		"-c:v", "libx264",
-		"-preset", "ultrafast",
-		"-tune", "zerolatency",
-		"-x264-params", "repeat-headers=1:scenecut=0",
-		"-pix_fmt", "yuv420p",
+		"-pix_fmt", pixelFormat,
 		"-b:v", fmt.Sprintf("%dk", bitrate),
 		"-maxrate", fmt.Sprintf("%dk", bitrate+bitrate/4),
 		"-bufsize", fmt.Sprintf("%dk", vbvBufferKbit(bitrate, fps)),
 		"-g", fmt.Sprintf("%d", keyframeInterval),
 		"-bf", "0",
-		"-f", "h264",
+		"-f", muxer,
 		"pipe:1",
 	)
-	return startFFmpegProcess(ctx, ffmpegPath, ffArgs, "FFMPEG")
+	capture, err := startFFmpegProcess(ctx, ffmpegPath, ffArgs, "FFMPEG")
+	if err == nil && normalizeVideoCodec(cfg.VideoCodec) == VideoCodecHEVC {
+		capture.frames = newAnnexBHEVCAccessUnitReader(capture.stdout)
+	}
+	return capture, err
 }
 
 func startFFmpegProcess(ctx context.Context, name string, args []string, logPrefix string) (*ScreenCapture, error) {

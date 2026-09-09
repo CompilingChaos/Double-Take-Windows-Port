@@ -20,11 +20,13 @@ import (
 
 // CaptureConfig holds screen capture settings.
 type CaptureConfig struct {
-	FPS       int
-	Bitrate   int    // Video bitrate in kbps (0 = auto)
-	HWAccel   string // "auto", "vaapi", "none"
-	MaxWidth  int    // receiver-advertised encoded canvas; zero keeps native size
-	MaxHeight int
+	FPS        int
+	Bitrate    int    // Video bitrate in kbps (0 = auto)
+	HWAccel    string // "auto", "vaapi", "none"
+	VideoCodec VideoCodec
+	MaxWidth   int // receiver-advertised encoded canvas; zero keeps native size
+	MaxHeight  int
+	ShowCursor bool
 
 	RestoreToken     string
 	SaveRestoreToken func(string) error
@@ -50,6 +52,7 @@ type ScreenCapture struct {
 	dbusConn *dbus.Conn    // portal session D-Bus connection (must stay open for Wayland)
 	waitCh   chan struct{} // closed when process exits
 	waitErr  error         // set before waitCh is closed
+	frames   videoAccessUnitReader
 	stopOnce sync.Once
 }
 
@@ -57,6 +60,9 @@ type ScreenCapture struct {
 // capture accordingly. On Wayland it uses xdg-desktop-portal + PipeWire for
 // capture; on X11 it uses ximagesrc. Both use GStreamer for H.264 encoding.
 func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
+	if normalizeVideoCodec(cfg.VideoCodec) == VideoCodecHEVC {
+		return nil, fmt.Errorf("HEVC capture is unavailable in this platform adapter")
+	}
 	if os.Getenv("WAYLAND_DISPLAY") != "" {
 		return startWaylandCapture(ctx, cfg)
 	}
@@ -64,6 +70,22 @@ func StartCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error
 		return startX11Capture(ctx, cfg)
 	}
 	return nil, fmt.Errorf("no display server detected (neither WAYLAND_DISPLAY nor DISPLAY is set)")
+}
+
+// AutomaticHEVCAvailable remains false until the split GStreamer adapter owns
+// the upstream timestamped HEVC pipeline.
+func AutomaticHEVCAvailable(hwaccel string) bool {
+	return false
+}
+
+// ValidateHWAccel checks a GStreamer capture acceleration value.
+func ValidateHWAccel(method string) error {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "", "auto", "nvenc", "vaapi", "none":
+		return nil
+	default:
+		return fmt.Errorf("unknown hardware acceleration %q (want auto, nvenc, vaapi, or none)", method)
+	}
 }
 
 func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
@@ -260,6 +282,13 @@ func (sc *ScreenCapture) Read(buf []byte) (int, error) {
 	default:
 	}
 	return sc.stdout.Read(buf)
+}
+
+func (sc *ScreenCapture) ReadVideoAccessUnit() (VideoAccessUnit, error) {
+	if sc == nil || sc.frames == nil {
+		return VideoAccessUnit{}, fmt.Errorf("timestamped video capture is unavailable")
+	}
+	return sc.frames.ReadVideoAccessUnit()
 }
 
 func (sc *ScreenCapture) Stop() {
@@ -482,6 +511,9 @@ func detectGstEncoder(cfg CaptureConfig) encoderResult {
 // This replicates the same GStreamer pipeline ecosystem that UxPlay uses on the
 // receiver side.
 func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
+	if normalizeVideoCodec(cfg.VideoCodec) == VideoCodecHEVC {
+		return nil, fmt.Errorf("HEVC test capture is unavailable in this platform adapter")
+	}
 	captureCtx, cancel := context.WithCancel(ctx)
 
 	fps := cfg.FPS
