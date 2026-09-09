@@ -2,6 +2,8 @@
 
 This is a Windows port of the [original Doubletake project](https://github.com/omarroth/doubletake).
 
+For Linux, use the original repository instead of this Windows port.
+
 It mirrors the Windows desktop and audio to Apple TV, Mac, and other compatible
 AirPlay receivers. It handles receiver discovery, PIN pairing, encrypted media
 transport, video encoding, audio capture, saved credentials, and simultaneous
