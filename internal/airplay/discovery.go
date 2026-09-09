@@ -91,6 +91,7 @@ func discoverAirPlayDevicesWindows(ctx context.Context) ([]AirPlayDevice, error)
 	}
 
 	mdnsResults := make(chan discoveryResult, 1)
+	unicastMDNSResults := make(chan discoveryResult, 1)
 	scanResults := make(chan discoveryResult, 1)
 	mdnsCtx, cancelMDNS := context.WithTimeout(ctx, 3*time.Second)
 	defer cancelMDNS()
@@ -98,6 +99,10 @@ func discoverAirPlayDevicesWindows(ctx context.Context) ([]AirPlayDevice, error)
 	go func() {
 		devices, err := browseAirPlayDevices(mdnsCtx)
 		mdnsResults <- discoveryResult{devices: devices, err: err}
+	}()
+	go func() {
+		devices, err := browseUnicastPreferredAirPlayDevices(mdnsCtx, preferredDiscoveryInterfaces())
+		unicastMDNSResults <- discoveryResult{devices: devices, err: err}
 	}()
 	go func() {
 		var devices []AirPlayDevice
@@ -111,13 +116,17 @@ func discoverAirPlayDevicesWindows(ctx context.Context) ([]AirPlayDevice, error)
 	}()
 
 	mdns := <-mdnsResults
+	unicastMDNS := <-unicastMDNSResults
 	scan := <-scanResults
-	devices := mergeAirPlayDevices(mdns.devices, scan.devices)
+	devices := mergeAirPlayDevices(mdns.devices, unicastMDNS.devices, scan.devices)
 	if len(devices) > 0 {
 		return preferAppleTVDevices(devices), nil
 	}
 	if scan.err != nil {
 		return nil, scan.err
+	}
+	if unicastMDNS.err != nil {
+		return nil, unicastMDNS.err
 	}
 	if mdns.err != nil {
 		return nil, mdns.err
@@ -132,7 +141,8 @@ func activeSubnetScanEnabled() bool {
 
 func browseAirPlayDevices(ctx context.Context) ([]AirPlayDevice, error) {
 	var opts []zeroconf.ClientOption
-	if ifaces := preferredDiscoveryInterfaces(); len(ifaces) > 0 {
+	ifaces := preferredDiscoveryInterfaces()
+	if len(ifaces) > 0 {
 		opts = append(opts, zeroconf.SelectIfaces(ifaces))
 		dbg("[DISCOVERY] using interfaces: %s", interfaceNames(ifaces))
 	}

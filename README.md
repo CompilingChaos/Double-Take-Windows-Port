@@ -149,11 +149,13 @@ and video when the advertised audio format is unavailable.
 ## Network discovery
 
 Doubletake uses multicast DNS (mDNS) discovery on Windows and Linux. This is a
-small multicast query rather than a scan of the local address range. When a
-Windows network filters mDNS, Doubletake also checks up to 64 real peers already
-present in the operating system's neighbor table. It caches that small fallback
-for 30 seconds and never fills the neighbor table by sweeping the subnet. If the
-receiver is not already known to Windows, connect directly with
+small multicast query rather than a scan of the local address range. On Windows,
+Doubletake requests unicast mDNS responses as defined by DNS-SD so managed
+Bonjour gateways can return their proxied AirPlay catalog even when ordinary
+multicast replies are filtered. It also checks up to 64 real peers already
+present in the operating system's neighbor table and caches that fallback for 30
+seconds. Neither path fills the neighbor table by sweeping the subnet. If the
+receiver is not advertised or already known to Windows, connect directly with
 `-target RECEIVER-IP`.
 
 Windows also has an optional fallback for trusted networks where mDNS is

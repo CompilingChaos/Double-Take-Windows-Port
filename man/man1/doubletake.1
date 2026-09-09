@@ -108,10 +108,12 @@ Run in daemon mode for multi-target control via
 Set the local daemon control endpoint. The default is 127.0.0.1:53531 on
 Windows and $XDG_RUNTIME_DIR/doubletake.sock on Unix.
 .SH ENVIRONMENT
-On Windows, discovery also checks up to 64 peers already present in the system
-neighbor table when mDNS is filtered. The result is cached for 30 seconds. This
-fallback does not sweep the subnet; use \fB\-target\fR when the receiver is not
-already known to Windows.
+On Windows, discovery requests unicast mDNS responses so managed Bonjour
+gateways can return a proxied AirPlay catalog when multicast replies are
+filtered. It also checks up to 64 peers already present in the system neighbor
+table and caches that fallback for 30 seconds. Neither fallback sweeps the
+subnet; use \fB\-target\fR when the receiver is not advertised or already known
+to Windows.
 .PP
 .TP
 .B DOUBLETAKE_DISCOVERY_SUBNET_SCAN
