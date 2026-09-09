@@ -71,7 +71,7 @@ func startFFmpegCapture(ctx context.Context, cfg CaptureConfig, ffmpegPath strin
 		"-hide_banner",
 		"-loglevel", "warning",
 		"-f", "gdigrab",
-		"-draw_mouse", strconv.FormatBool(cfg.ShowCursor),
+		"-draw_mouse", ffmpegBoolean(cfg.ShowCursor),
 		"-framerate", fmt.Sprintf("%d", fps),
 		"-i", "desktop",
 		"-an",
@@ -102,6 +102,13 @@ func startFFmpegCapture(ctx context.Context, cfg CaptureConfig, ffmpegPath strin
 		capture.frames = newAnnexBHEVCAccessUnitReader(capture.stdout)
 	}
 	return capture, err
+}
+
+func ffmpegBoolean(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
 }
 
 func ffmpegVideoEncoder(cfg CaptureConfig, ffmpegPath string) (args []string, pixelFormat, muxer string, err error) {

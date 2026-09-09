@@ -65,3 +65,12 @@ func TestLocateFFmpegMissingErrorIsActionable(t *testing.T) {
 		}
 	}
 }
+
+func TestFFmpegBooleanUsesNumericOptionValues(t *testing.T) {
+	if got := ffmpegBoolean(true); got != "1" {
+		t.Fatalf("ffmpegBoolean(true) = %q, want 1", got)
+	}
+	if got := ffmpegBoolean(false); got != "0" {
+		t.Fatalf("ffmpegBoolean(false) = %q, want 0", got)
+	}
+}
