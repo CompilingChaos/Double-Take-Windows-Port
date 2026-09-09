@@ -107,6 +107,14 @@ Run in daemon mode for multi-target control via
 .B \-socket \fIENDPOINT\fR
 Set the local daemon control endpoint. The default is 127.0.0.1:53531 on
 Windows and $XDG_RUNTIME_DIR/doubletake.sock on Unix.
+.SH ENVIRONMENT
+.TP
+.B DOUBLETAKE_DISCOVERY_SUBNET_SCAN
+When set to a true value on Windows, supplement mDNS with active TCP port 7000
+probes of every address in each local subnet. This fallback is disabled by
+default and should be used only on trusted networks; managed networks may
+classify it as a port scan. Use \fB\-target\fR instead when the receiver address
+is known.
 .SH EXAMPLES
 .TP
 Discover and connect to an AirPlay receiver on the network:

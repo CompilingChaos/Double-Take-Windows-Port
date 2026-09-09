@@ -39,6 +39,28 @@ func TestUnescapeDNSName(t *testing.T) {
 	}
 }
 
+func TestActiveSubnetScanEnabled(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "", want: false},
+		{value: "0", want: false},
+		{value: "false", want: false},
+		{value: "invalid", want: false},
+		{value: "1", want: true},
+		{value: "true", want: true},
+		{value: "TRUE", want: true},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			t.Setenv("DOUBLETAKE_DISCOVERY_SUBNET_SCAN", test.value)
+			if got := activeSubnetScanEnabled(); got != test.want {
+				t.Fatalf("activeSubnetScanEnabled() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSupportsFairPlaySAP(t *testing.T) {
 	rokuFeatures := uint64(0x38bcf46007f8ad0)
 	if (&ReceiverInfo{Features: rokuFeatures}).SupportsFairPlaySAP() {

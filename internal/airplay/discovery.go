@@ -85,6 +85,10 @@ func DiscoverAirPlayDevices(ctx context.Context) ([]AirPlayDevice, error) {
 }
 
 func discoverAirPlayDevicesWindows(ctx context.Context) ([]AirPlayDevice, error) {
+	if !activeSubnetScanEnabled() {
+		return browseAirPlayDevices(ctx)
+	}
+
 	type discoveryResult struct {
 		devices []AirPlayDevice
 		err     error
@@ -117,6 +121,11 @@ func discoverAirPlayDevicesWindows(ctx context.Context) ([]AirPlayDevice, error)
 		return nil, mdns.err
 	}
 	return nil, nil
+}
+
+func activeSubnetScanEnabled() bool {
+	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("DOUBLETAKE_DISCOVERY_SUBNET_SCAN")))
+	return err == nil && enabled
 }
 
 func browseAirPlayDevices(ctx context.Context) ([]AirPlayDevice, error) {
