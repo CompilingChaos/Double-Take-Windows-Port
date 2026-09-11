@@ -42,10 +42,11 @@ const (
 
 // Request is a command sent to the daemon over the control socket.
 type Request struct {
-	Cmd    string `json:"cmd"`
-	Target string `json:"target,omitempty"`
-	Port   int    `json:"port,omitempty"`
-	Pin    string `json:"pin,omitempty"`
+	Cmd     string `json:"cmd"`
+	Target  string `json:"target,omitempty"`
+	Port    int    `json:"port,omitempty"`
+	Pin     string `json:"pin,omitempty"`
+	NoAudio bool   `json:"no_audio,omitempty"`
 }
 
 // StreamInfo describes one active (or connecting) mirror stream.
@@ -149,6 +150,7 @@ type activeStream struct {
 	deviceIP       string
 	deviceID       string
 	state          State
+	noAudio        bool
 	audioMuted     bool
 	session        *airplay.MirrorSession
 	client         *airplay.AirPlayClient
@@ -551,7 +553,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 			Device:         s.device,
 			DeviceIP:       s.deviceIP,
 			State:          s.state,
-			HasAudio:       s.session != nil && s.session.HasAudio(),
+			HasAudio:       !s.noAudio && s.session != nil && s.session.HasAudio(),
 			AudioMuted:     s.audioMuted,
 			CredentialKind: waitingCredentialKind(s),
 		})
@@ -738,6 +740,7 @@ func (d *Daemon) handleConnect(req Request) Response {
 	entry := &activeStream{
 		deviceIP:     target,
 		state:        StateConnecting,
+		noAudio:      d.cfg.NoAudio || req.NoAudio,
 		cancelFn:     cancel,
 		credentialCh: make(chan string, 1),
 	}
@@ -1075,6 +1078,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 
 	streamCfg := d.mirrorStreamConfig()
+	streamCfg.NoAudio = entry.noAudio
 	streamCfg.AutomaticHEVCAvailable = airplay.AutomaticHEVCAvailable(d.cfg.HWAccel)
 	var broadcast *airplay.BroadcastCapture
 	selectedCaptureKey := videoCaptureKey{maxWidth: -1, maxHeight: -1}
@@ -1161,7 +1165,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	// so the stream worker does not outlive daemon shutdown.
 	var audioCapture *airplay.AudioCapture
 	var audioDone chan error
-	if !d.cfg.NoAudio && session.HasAudio() {
+	if !entry.noAudio && session.HasAudio() {
 		var audioErr error
 		audioCapture, audioErr = airplay.StartAudioCapture(ctx, d.cfg.TestMode, session.AudioCodec())
 		if audioErr != nil {
@@ -1537,7 +1541,7 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 
 	sessions := make([]*airplay.MirrorSession, 0, len(targets))
 	for _, t := range targets {
-		if t.session != nil && (d.cfg.NoAudio || t.session.HasAudio()) {
+		if !t.noAudio && t.session != nil && t.session.HasAudio() {
 			sessions = append(sessions, t.session)
 		}
 	}

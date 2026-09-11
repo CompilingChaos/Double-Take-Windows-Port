@@ -54,6 +54,27 @@ Run the test suite with:
 .\build.ps1 -Test
 ```
 
+## Local Apple TV Test Receiver
+
+The repository includes a diagnostic AirPlay receiver that validates pairing,
+session setup, timing, and media packets without displaying video or playing
+audio. To make it appear in the normal receiver picker as an Apple TV 3:
+
+```powershell
+.\bin\doubletake-test-receiver.exe -profile appletv3 -name "Test Apple TV" -listen 127.0.0.1:7000 -advertise -stats-interval 2s
+```
+
+In a second terminal, run `doubletake` and select `Test Apple TV`. The sender
+will then ask whether audio should be streamed. If mDNS is unavailable, use a
+direct connection instead:
+
+```powershell
+.\bin\doubletake.exe -target 127.0.0.1 -port 7000 -test
+```
+
+The receiver prints protocol and packet statistics and is intentionally a
+diagnostic sink rather than a media player.
+
 ## Usage
 
 Discover receivers and connect:
@@ -109,8 +130,9 @@ because command-line arguments may be visible to other users.
 
 Windows discovery uses mDNS and requests unicast responses so managed Bonjour
 gateways can return AirPlay receivers across filtered multicast networks. It
-also checks a small number of peers already known to Windows. It does not scan
-the local subnet by default.
+also checks a small number of peers already known to Windows and probes the
+local test-receiver address `127.0.0.1:7000`. It does not scan the local subnet
+by default.
 
 When the receiver address is known, `-target` is the most reliable option. An
 active subnet fallback can be enabled on a trusted network with:

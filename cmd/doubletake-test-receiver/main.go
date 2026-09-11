@@ -6,11 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/grandcat/zeroconf"
 
 	"doubletake/internal/airplay"
 )
@@ -31,6 +34,7 @@ func run(args []string) int {
 	name := flags.String("name", "", "receiver name advertised by /info (profile default when empty)")
 	model := flags.String("model", "", "receiver model advertised by /info (profile default when empty)")
 	deviceID := flags.String("device-id", "", "receiver device ID advertised by /info (random when empty)")
+	advertise := flags.Bool("advertise", false, "advertise the receiver through local mDNS/DNS-SD")
 	debug := flags.Bool("debug", false, "enable verbose receiver protocol logging")
 	statsInterval := flags.Duration("stats-interval", 0, "periodic statistics interval (0 disables periodic output)")
 	if err := flags.Parse(args); err != nil {
@@ -81,6 +85,16 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "error: start receiver: %v\n", err)
 		return 1
 	}
+	var mdnsServer *zeroconf.Server
+	if *advertise {
+		mdnsServer, err = registerAirPlayService(server)
+		if err != nil {
+			_ = server.Close()
+			fmt.Fprintf(os.Stderr, "error: advertise receiver: %v\n", err)
+			return 1
+		}
+		fmt.Printf("doubletake test receiver advertised as %q\n", server.AirPlayServiceName())
+	}
 
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	fmt.Printf("doubletake test receiver listening on %s (profile=%s auth=%s)\n", server.Addr(), profile, auth)
@@ -95,6 +109,9 @@ func run(args []string) int {
 	serveErr := server.Serve(ctx)
 	stopSignals()
 	<-statsDone
+	if mdnsServer != nil {
+		mdnsServer.Shutdown()
+	}
 	closeErr := server.Close()
 	fmt.Printf("final stats: %s\n", receiverStatsSummary(server.Stats()))
 
@@ -107,6 +124,23 @@ func run(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func registerAirPlayService(server *airplay.ReceiverServer) (*zeroconf.Server, error) {
+	address, ok := server.Addr().(*net.TCPAddr)
+	if !ok || address == nil || address.Port == 0 {
+		return nil, fmt.Errorf("receiver listener has no usable TCP address")
+	}
+	const service = "_airplay._tcp"
+	const domain = "local."
+	text := server.AirPlayServiceTXT()
+	if address.IP == nil || address.IP.IsUnspecified() {
+		return zeroconf.Register(server.AirPlayServiceName(), service, domain, address.Port, text, nil)
+	}
+	return zeroconf.RegisterProxy(
+		server.AirPlayServiceName(), service, domain, address.Port,
+		server.AirPlayServiceHostName(), []string{address.IP.String()}, text, nil,
+	)
 }
 
 func parseReceiverProfile(value string) (airplay.ReceiverProfile, error) {

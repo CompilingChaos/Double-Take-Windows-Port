@@ -20,6 +20,8 @@ PlasmoidItem {
     property var streamList: []
     property string errorText: ""
     property var pendingCommands: (new Object())
+    property string pendingTargetIP: ""
+    property string pendingTargetName: ""
 
     // Sorted device list: active stream targets pinned to top, rest sorted by IP
     readonly property var sortedDeviceList: {
@@ -110,6 +112,23 @@ PlasmoidItem {
     function isDeviceAudioMuted(ip) {
         var s = root.streamForIP(ip)
         return !!s && !!s.audio_muted
+    }
+
+    function requestConnection(device) {
+        if (!device || root.isBusy) return
+        root.pendingTargetIP = device.ip || ""
+        root.pendingTargetName = device.name || device.ip || "the device"
+        audioChoiceDialog.open()
+    }
+
+    function connectToPendingTarget(noAudio) {
+        if (root.pendingTargetIP === "") return
+        var args = []
+        if (noAudio) args.push("-no-audio")
+        args.push("connect", root.pendingTargetIP)
+        root.runCtl(args, "connect")
+        root.pendingTargetIP = ""
+        root.pendingTargetName = ""
     }
 
     // --- Daemon communication ---
@@ -232,7 +251,7 @@ PlasmoidItem {
                     if (root.isStreaming) {
                         root.runCtl(["disconnect"], "disconnect")
                     } else if (root.deviceList.length > 0) {
-                        root.runCtl(["connect", root.deviceList[0].ip], "connect")
+                        root.requestConnection(root.deviceList[0])
                     }
                 } else {
                     root.expanded = !root.expanded
@@ -302,6 +321,26 @@ PlasmoidItem {
 
             Kirigami.Separator {
                 Layout.fillWidth: true
+            }
+
+            Controls.Dialog {
+                id: audioChoiceDialog
+                modal: true
+                title: "Stream audio?"
+                standardButtons: Controls.Dialog.Yes | Controls.Dialog.No
+
+                ColumnLayout {
+                    spacing: Kirigami.Units.smallSpacing
+
+                    PlasmaComponents.Label {
+                        Layout.fillWidth: true
+                        text: "Do you want to stream audio to " + root.pendingTargetName + "?"
+                        wrapMode: Text.WordWrap
+                    }
+                }
+
+                onAccepted: root.connectToPendingTarget(false)
+                onRejected: root.connectToPendingTarget(true)
             }
 
             // PIN input section (shown when device requires pairing)
@@ -471,7 +510,7 @@ PlasmoidItem {
                                     if (deviceDelegate.isThisDeviceStreaming) {
                                         root.runCtl(["disconnect", modelData.ip], "disconnect")
                                     } else {
-                                        root.runCtl(["connect", modelData.ip], "connect")
+                                        root.requestConnection(modelData)
                                     }
                                 }
                             }
@@ -481,7 +520,7 @@ PlasmoidItem {
                             if (deviceDelegate.isThisDeviceStreaming) {
                                 root.runCtl(["disconnect", modelData.ip], "disconnect")
                             } else if (!root.isBusy) {
-                                root.runCtl(["connect", modelData.ip], "connect")
+                                root.requestConnection(modelData)
                             }
                         }
                     }

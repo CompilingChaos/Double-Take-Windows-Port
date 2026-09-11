@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -442,6 +443,31 @@ func randomReceiverDeviceID() (string, error) {
 
 // Addr returns the actual bound control address, including an ephemeral port.
 func (s *ReceiverServer) Addr() net.Addr { return s.listener.Addr() }
+
+// AirPlayServiceName returns the instance name used when this receiver is
+// advertised through DNS-SD.
+func (s *ReceiverServer) AirPlayServiceName() string { return s.cfg.Name }
+
+// AirPlayServiceHostName returns a stable local hostname for DNS-SD SRV data.
+func (s *ReceiverServer) AirPlayServiceHostName() string {
+	return "doubletake-test-receiver-" + strings.ReplaceAll(strings.ToLower(s.cfg.DeviceID), ":", "") + ".local."
+}
+
+// AirPlayServiceTXT returns the capability records used by AirPlay discovery.
+// The control endpoint remains authoritative; these records only make the test
+// receiver appear in the sender's normal device picker.
+func (s *ReceiverServer) AirPlayServiceTXT() []string {
+	return []string{
+		"deviceid=" + s.cfg.DeviceID,
+		fmt.Sprintf("features=0x%08x,0x%08x", uint32(s.profile.features), uint32(s.profile.features>>32)),
+		"flags=0x4",
+		"model=" + s.cfg.Model,
+		"pk=" + hex.EncodeToString(s.publicKey),
+		"protovers=1.1",
+		"srcvers=" + s.profile.sourceVersion,
+		"vv=2",
+	}
+}
 
 // Serve accepts control connections until ctx is cancelled or Close is called.
 func (s *ReceiverServer) Serve(ctx context.Context) error {

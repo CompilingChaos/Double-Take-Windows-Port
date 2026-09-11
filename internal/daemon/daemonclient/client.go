@@ -42,7 +42,12 @@ func (c *Client) Devices() (*daemon.Response, error) {
 
 // Connect starts mirroring to the specified target (or first discovered device if empty).
 func (c *Client) Connect(target string, port int, pin string) (*daemon.Response, error) {
-	return c.send(daemon.Request{Cmd: "connect", Target: target, Port: port, Pin: pin})
+	return c.ConnectWithOptions(target, port, pin, false)
+}
+
+// ConnectWithOptions starts mirroring with per-target media options.
+func (c *Client) ConnectWithOptions(target string, port int, pin string, noAudio bool) (*daemon.Response, error) {
+	return c.send(daemon.Request{Cmd: "connect", Target: target, Port: port, Pin: pin, NoAudio: noAudio})
 }
 
 // Disconnect stops all active mirroring sessions.

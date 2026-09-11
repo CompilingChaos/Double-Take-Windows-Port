@@ -153,6 +153,9 @@ func main() {
 		*port = device.Port
 		advertisement = device
 		fmt.Printf("selected: %s (%s:%d)\n", device.Name, device.IP, device.Port)
+		if !*noAudio {
+			*noAudio = promptNoAudio()
+		}
 	}
 
 	newClient := func() *airplay.AirPlayClient {
@@ -449,6 +452,16 @@ func readCredential(reader *bufio.Reader, prompt string) string {
 		fatalf("failed to read credential: %v", err)
 	}
 	return strings.TrimRight(line, "\r\n")
+}
+
+func promptNoAudio() bool {
+	fmt.Print("Stream audio to this receiver? [Y/n]: ")
+	var input string
+	if _, err := fmt.Scanln(&input); err != nil {
+		return false
+	}
+	input = strings.TrimSpace(input)
+	return strings.EqualFold(input, "n") || strings.EqualFold(input, "no")
 }
 
 func selectDevice(ctx context.Context) (*airplay.AirPlayDevice, error) {

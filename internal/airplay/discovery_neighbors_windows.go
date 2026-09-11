@@ -232,14 +232,18 @@ func airPlayInstanceName(name string) string {
 }
 
 func knownNeighborTargets(ifaces []net.Interface) []string {
+	// A loopback AirPlay receiver is useful for local protocol testing and does
+	// not depend on the host's mDNS responder or network profile. The default
+	// test receiver listens on port 7000, which is the probe port used here.
+	targets := []string{"127.0.0.1"}
 	if len(ifaces) == 0 {
-		return nil
+		return targets
 	}
 
 	var size uint32
 	status, _, _ := getIPNetTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
 	if status != windowsErrorInsufficientBuffer || size < 4 {
-		return nil
+		return targets
 	}
 
 	table := make([]byte, size)
@@ -249,7 +253,7 @@ func knownNeighborTargets(ifaces []net.Interface) []string {
 		0,
 	)
 	if status != 0 {
-		return nil
+		return targets
 	}
 
 	interfaceIndexes := make(map[uint32]struct{}, len(ifaces))
@@ -268,7 +272,8 @@ func knownNeighborTargets(ifaces []net.Interface) []string {
 		}
 	}
 
-	return parseKnownNeighborTable(table[:size], interfaceIndexes, localAddresses)
+	targets = append(targets, parseKnownNeighborTable(table[:size], interfaceIndexes, localAddresses)...)
+	return uniqueStrings(targets)
 }
 
 func parseKnownNeighborTable(table []byte, interfaceIndexes map[uint32]struct{}, localAddresses map[string]struct{}) []string {

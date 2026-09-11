@@ -193,6 +193,15 @@ Receiver device ID advertised by
 An empty value generates a random locally administered identifier for this
 process.
 .TP
+.B \-advertise
+Advertise the receiver as an
+.B _airplay._tcp
+DNS-SD service on the local network so it appears in the sender's device
+picker. A loopback listener is advertised with a loopback address for local
+testing; use a non-loopback
+.B \-listen
+address when testing from another machine.
+.TP
 .B \-debug
 Enable verbose receiver protocol logging.
 .TP
@@ -220,6 +229,9 @@ Connect a synthetic sender using that password:
 Exercise modern pairing and Digest authentication with one shared fixed
 password (no on-screen PIN):
 .B DOUBLETAKE_RECEIVER_CODE=4827 doubletake-test-receiver \-profile modern \-auth combined \-stats-interval 2s
+.TP
+Show the legacy Apple TV profile in the sender's discovery list:
+.B doubletake-test-receiver \-profile appletv3 \-name "Test Apple TV" \-advertise
 .TP
 Run an unauthenticated receiver on an ephemeral port:
 .B doubletake-test-receiver \-listen 127.0.0.1:0
