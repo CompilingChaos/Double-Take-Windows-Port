@@ -9,26 +9,11 @@ AirPlay receivers. It handles receiver discovery, PIN pairing, encrypted media
 transport, video encoding, audio capture, saved credentials, and simultaneous
 connections.
 
-## Functionality
-
-- Captures the Windows desktop with FFmpeg and audio through Windows WASAPI.
-- Encodes H.264 with `libx264` or NVIDIA NVENC.
-- Encodes HEVC Main10 with `libx265` or NVIDIA NVENC when the receiver and local
-  hardware support it.
-- Discovers AirPlay receivers through mDNS, including managed-network Bonjour
-  gateways.
-- Supports direct connections with a receiver IP address or hostname.
-- Pairs with an onscreen PIN and saves credentials for later connections.
-- Supports receiver passwords through `-code` or `DOUBLETAKE_CODE`.
-- Streams to multiple receivers through the `doubletake-ctl` daemon interface.
-- Supports optional audio disable, cursor hiding, bitrate, frame-rate, codec,
-  latency, and UDP port-range controls.
-
 ## Requirements
 
-- Windows with FFmpeg available on `PATH`, or `ffmpeg.exe` beside
-  `doubletake.exe`.
-- A receiver reachable from the same network, or a known receiver address.
+- Windows
+- FFmpeg installed and available on `PATH`, or `ffmpeg.exe` in the same folder as `doubletake.exe`
+- An AirPlay receiver on the same network
 
 Install FFmpeg with WinGet:
 
@@ -36,129 +21,63 @@ Install FFmpeg with WinGet:
 winget install --id Gyan.FFmpeg --exact
 ```
 
-## Build
+## Run
+
+Extract the release files to a folder and double-click `doubletake.exe`.
+
+Select a receiver from the list.
+
+The first connection may ask for the PIN shown on the receiver. Credentials are saved automatically for later connections.
+
+## If No Receiver Is Found
+
+Connect directly using the receiver's IP address:
 
 ```powershell
-.\build.ps1
+.\doubletake.exe -target 192.168.1.77
 ```
 
-The executables are written to `bin\`:
+The default AirPlay port is `7000`. Use `-port` if the receiver uses another port.
 
-- `doubletake.exe`
-- `doubletake-ctl.exe`
-- `doubletake-test-receiver.exe`
+## Disable Audio
 
-Run the test suite with:
+When selecting a discovered receiver, choose **No** when asked whether audio should be streamed.
+
+To disable audio automatically:
 
 ```powershell
-.\build.ps1 -Test
+.\doubletake.exe -target 192.168.1.77 -no-audio
 ```
 
-## Local Apple TV Test Receiver
+## Pair Again
 
-The repository includes a diagnostic AirPlay receiver that validates pairing,
-session setup, timing, and media packets without displaying video or playing
-audio. To make it appear in the normal receiver picker as an Apple TV 3:
+To force a new pairing:
 
 ```powershell
-.\bin\doubletake-test-receiver.exe -profile appletv3 -name "Test Apple TV" -listen 127.0.0.1:7000 -advertise -stats-interval 2s
+.\doubletake.exe -target 192.168.1.77 -pair
 ```
 
-In a second terminal, run `doubletake` and select `Test Apple TV`. The sender
-will then ask whether audio should be streamed. If mDNS is unavailable, use a
-direct connection instead:
-
-```powershell
-.\bin\doubletake.exe -target 127.0.0.1 -port 7000 -test
-```
-
-The receiver prints protocol and packet statistics and is intentionally a
-diagnostic sink rather than a media player.
-
-## Usage
-
-Discover receivers and connect:
-
-```powershell
-doubletake
-```
-
-Connect directly when discovery is unavailable:
-
-```powershell
-doubletake -target 192.168.1.77
-```
-
-Pair with a receiver for the first time:
-
-```powershell
-doubletake -target 192.168.1.77 -pair
-```
-
-Useful options:
-
-```powershell
-doubletake -target 192.168.1.77 -no-audio
-doubletake -target 192.168.1.77 -no-cursor
-doubletake -target 192.168.1.77 -video-codec h264
-doubletake -target 192.168.1.77 -video-codec hevc
-doubletake -target 192.168.1.77 -fps 30 -bitrate 4500
-doubletake -target 192.168.1.77 -port-range 60000-60010
-```
-
-Use `doubletake -help` for the complete option list.
-
-## Pairing And Passwords
-
-During pairing, enter the PIN shown on the receiver. Credentials are stored in:
-
-```text
-%APPDATA%\doubletake\credentials.json
-```
-
-For a receiver configured with a fixed password, use:
+For a receiver that uses a fixed password:
 
 ```powershell
 $env:DOUBLETAKE_CODE = "your-password"
-doubletake -target 192.168.1.77
+.\doubletake.exe -target 192.168.1.77
 ```
 
-The `-code` option can be used instead. The environment variable is preferred
-because command-line arguments may be visible to other users.
+## Test Without an Apple TV
 
-## Discovery
-
-Windows discovery uses mDNS and requests unicast responses so managed Bonjour
-gateways can return AirPlay receivers across filtered multicast networks. It
-also checks a small number of peers already known to Windows and probes the
-local test-receiver address `127.0.0.1:7000`. It does not scan the local subnet
-by default.
-
-When the receiver address is known, `-target` is the most reliable option. An
-active subnet fallback can be enabled on a trusted network with:
+Start the included diagnostic receiver by double-clicking `doubletake-test-receiver.exe`, or run it with these options:
 
 ```powershell
-$env:DOUBLETAKE_DISCOVERY_SUBNET_SCAN = "1"
-doubletake
+.\doubletake-test-receiver.exe -profile appletv3 -name "Test Apple TV" -listen 127.0.0.1:7000
 ```
 
-## Daemon Control
-
-Run the daemon with a fixed local UDP port range:
+Then run:
 
 ```powershell
-doubletake -daemonize -port-range 60000-60010
-doubletake-ctl status
-doubletake-ctl discover
-doubletake-ctl devices
-doubletake-ctl connect 192.168.1.77
-doubletake-ctl disconnect 192.168.1.77
-doubletake-ctl disconnect
+.\doubletake.exe -target 127.0.0.1 -port 7000 -test -no-audio
 ```
 
-Use `doubletake-ctl connect TARGET PIN-or-password` when a receiver requests a
-PIN or password while multiple receivers are waiting.
+The test receiver reports protocol and packet statistics. It does not display video or play audio.
 
-## License
-
-Licensed under the [GNU Lesser General Public License v3.0 or later](LICENSE).
+Use `doubletake.exe -help` for the complete option list.
