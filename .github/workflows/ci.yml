@@ -67,14 +67,12 @@ jobs:
         run: make manpages-release
 
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
         with:
-          name: release-assets-${{ runner.os }}
+          name: release-assets-windows
           path: |
-            doubletake${{ matrix.exe }}
+            doubletake.exe
             doubletake-cli.exe
-            doubletake-ctl${{ matrix.exe }}
-            doubletake-test-receiver.exe
-            doubletake-manpages.tar.gz
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -114,12 +112,5 @@ jobs:
           name: Double-Take Windows Port ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.RELEASE_NOTES }}
           files: |
-            doubletake
-            doubletake-ctl
             doubletake.exe
             doubletake-cli.exe
-            doubletake-ctl.exe
-            doubletake-test-receiver.exe
-            doubletake-manpages.tar.gz
-            assets/doubletake-icon.png
-            assets/doubletake.ico
