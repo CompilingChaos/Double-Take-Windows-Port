@@ -42,11 +42,13 @@ const (
 
 // Request is a command sent to the daemon over the control socket.
 type Request struct {
-	Cmd     string `json:"cmd"`
-	Target  string `json:"target,omitempty"`
-	Port    int    `json:"port,omitempty"`
-	Pin     string `json:"pin,omitempty"`
-	NoAudio bool   `json:"no_audio,omitempty"`
+	Cmd        string `json:"cmd"`
+	Target     string `json:"target,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	Pin        string `json:"pin,omitempty"`
+	NoAudio    bool   `json:"no_audio,omitempty"`
+	StartMuted bool   `json:"start_muted,omitempty"`
+	Volume     *int   `json:"volume,omitempty"`
 }
 
 // StreamInfo describes one active (or connecting) mirror stream.
@@ -56,17 +58,21 @@ type StreamInfo struct {
 	State          State          `json:"state"`
 	HasAudio       bool           `json:"has_audio"`
 	AudioMuted     bool           `json:"audio_muted"`
+	AudioVolume    int            `json:"audio_volume"`
+	Frozen         bool           `json:"frozen"`
 	CredentialKind CredentialKind `json:"credential_kind,omitempty"`
 }
 
 // Response is returned to the caller for every request.
 type Response struct {
-	OK         bool   `json:"ok"`
-	State      State  `json:"state"`
-	Device     string `json:"device,omitempty"`
-	DeviceIP   string `json:"device_ip,omitempty"`
-	HasAudio   bool   `json:"has_audio"`
-	AudioMuted bool   `json:"audio_muted"`
+	OK          bool   `json:"ok"`
+	State       State  `json:"state"`
+	Device      string `json:"device,omitempty"`
+	DeviceIP    string `json:"device_ip,omitempty"`
+	HasAudio    bool   `json:"has_audio"`
+	AudioMuted  bool   `json:"audio_muted"`
+	AudioVolume int    `json:"audio_volume"`
+	Frozen      bool   `json:"frozen"`
 	// NeedsPIN is retained for older clients and is true only for an on-screen
 	// PIN. NeedsCredential and CredentialKind distinguish configured passwords.
 	NeedsPIN        bool           `json:"needs_pin,omitempty"`
@@ -151,7 +157,10 @@ type activeStream struct {
 	deviceID       string
 	state          State
 	noAudio        bool
+	startMuted     bool
 	audioMuted     bool
+	audioVolume    int
+	frozen         bool
 	session        *airplay.MirrorSession
 	client         *airplay.AirPlayClient
 	sink           *airplay.BroadcastSink // fan-out video sink (nil when no broadcast)
@@ -250,6 +259,7 @@ func (cleanup *daemonCleanup) run() {
 type Daemon struct {
 	cfg            Config
 	mu             sync.Mutex
+	audioControlMu sync.Mutex // serializes receiver volume and mute updates
 	devices        []airplay.AirPlayDevice
 	deviceLastSeen map[string]time.Time // keyed by IP
 	credStore      *airplay.CredentialStore
@@ -508,6 +518,12 @@ func (d *Daemon) handleRequest(req Request) Response {
 		return d.handleSetMute(req, true)
 	case "unmute":
 		return d.handleSetMute(req, false)
+	case "volume":
+		return d.handleSetVolume(req)
+	case "freeze":
+		return d.handleSetFrozen(req, true)
+	case "unfreeze":
+		return d.handleSetFrozen(req, false)
 	default:
 		return Response{OK: false, Error: "unknown command: " + req.Cmd}
 	}
@@ -555,6 +571,8 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 			State:          s.state,
 			HasAudio:       !s.noAudio && s.session != nil && s.session.HasAudio(),
 			AudioMuted:     s.audioMuted,
+			AudioVolume:    s.audioVolume,
+			Frozen:         s.frozen,
 			CredentialKind: waitingCredentialKind(s),
 		})
 	}
@@ -568,7 +586,8 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 	// Populate legacy single-stream fields using the first streaming entry for
 	// backwards-compatibility with existing clients.
 	var device, deviceIP string
-	var hasAudio, audioMuted bool
+	var hasAudio, audioMuted, frozen bool
+	var audioVolume int
 	var credentialKind CredentialKind
 	for _, s := range streams {
 		if s.State == StateStreaming {
@@ -576,6 +595,8 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 			deviceIP = s.DeviceIP
 			hasAudio = s.HasAudio
 			audioMuted = s.AudioMuted
+			audioVolume = s.AudioVolume
+			frozen = s.Frozen
 			break
 		}
 	}
@@ -598,6 +619,8 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 		DeviceIP:        deviceIP,
 		HasAudio:        hasAudio,
 		AudioMuted:      audioMuted,
+		AudioVolume:     audioVolume,
+		Frozen:          frozen,
 		NeedsPIN:        credentialKind == CredentialKindPIN,
 		NeedsCredential: credentialKind != "",
 		CredentialKind:  credentialKind,
@@ -737,10 +760,16 @@ func (d *Daemon) handleConnect(req Request) Response {
 	// Create the context before publishing the entry so a concurrent disconnect
 	// can always cancel the connection goroutine.
 	connCtx, cancel := context.WithCancel(context.Background())
+	initialVolume := 100
+	if req.StartMuted {
+		initialVolume = 50
+	}
 	entry := &activeStream{
 		deviceIP:     target,
 		state:        StateConnecting,
 		noAudio:      d.cfg.NoAudio || req.NoAudio,
+		startMuted:   req.StartMuted,
+		audioVolume:  initialVolume,
 		cancelFn:     cancel,
 		credentialCh: make(chan string, 1),
 	}
@@ -1131,12 +1160,34 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		removeStream("mirror setup completed without preparing video capture")
 		return
 	}
+	if entry.startMuted && session.HasAudio() {
+		if err := session.SetAudioVolume(entry.audioVolume, true); err != nil {
+			_ = session.Close()
+			removeStream(fmt.Sprintf("mute receiver audio during setup: %v", err))
+			return
+		}
+	}
+	// GUI connections require the local endpoint to be muted before a stream is
+	// published. A failure must not leave a nominal audio session playing from
+	// the Windows speakers while the receiver's audio control appears usable.
+	var audioCapture *airplay.AudioCapture
+	if entry.startMuted && !entry.noAudio && session.HasAudio() {
+		audioCapture, err = airplay.StartAudioCapture(ctx, d.cfg.TestMode, session.AudioCodec())
+		if err != nil {
+			_ = session.Close()
+			removeStream(fmt.Sprintf("start muted audio capture: %v", err))
+			return
+		}
+	}
 
 	d.mu.Lock()
 	current, ok := d.streams[target]
 	if !ok || current != entry {
 		// Stream was cancelled while we were setting up
 		d.mu.Unlock()
+		if audioCapture != nil {
+			audioCapture.Stop()
+		}
 		_ = session.Close()
 		d.mu.Lock()
 		cleanup := d.detachCaptureGroupIfUnusedLocked(entry.captureGroup)
@@ -1151,7 +1202,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	current.session = session
 	current.client = client
 	current.sink = sink
-	current.audioMuted = false
+	current.audioMuted = entry.startMuted && session.HasAudio()
 	d.mu.Unlock()
 
 	log.Printf("[daemon] streaming to %s (%s) at %dx%d using %s",
@@ -1163,11 +1214,12 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 
 	// Start audio for this stream independently, but retain a completion channel
 	// so the stream worker does not outlive daemon shutdown.
-	var audioCapture *airplay.AudioCapture
 	var audioDone chan error
 	if !entry.noAudio && session.HasAudio() {
 		var audioErr error
-		audioCapture, audioErr = airplay.StartAudioCapture(ctx, d.cfg.TestMode, session.AudioCodec())
+		if audioCapture == nil {
+			audioCapture, audioErr = airplay.StartAudioCapture(ctx, d.cfg.TestMode, session.AudioCodec())
+		}
 		if audioErr != nil {
 			log.Printf("[daemon] audio capture failed: %v (continuing without audio)", audioErr)
 		} else {
@@ -1514,6 +1566,8 @@ func (d *Daemon) handleDisconnect(req Request) Response {
 }
 
 func (d *Daemon) handleSetMute(req Request, muted bool) Response {
+	d.audioControlMu.Lock()
+	defer d.audioControlMu.Unlock()
 	d.mu.Lock()
 
 	var targets []*activeStream
@@ -1539,17 +1593,30 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 		return resp
 	}
 
-	sessions := make([]*airplay.MirrorSession, 0, len(targets))
+	type audioControl struct {
+		session *airplay.MirrorSession
+		volume  int
+	}
+	sessions := make([]audioControl, 0, len(targets))
 	for _, t := range targets {
 		if !t.noAudio && t.session != nil && t.session.HasAudio() {
-			sessions = append(sessions, t.session)
+			volume := t.audioVolume
+			if !muted && volume == 0 {
+				volume = 50
+			}
+			sessions = append(sessions, audioControl{session: t.session, volume: volume})
 		}
+	}
+	if len(sessions) == 0 {
+		resp := d.statusResponseLocked(false, "audio is not streaming")
+		d.mu.Unlock()
+		return resp
 	}
 	d.mu.Unlock()
 
 	var lastErr error
 	for _, s := range sessions {
-		if err := s.SetAudioMuted(muted); err != nil {
+		if err := s.session.SetAudioVolume(s.volume, muted); err != nil {
 			lastErr = err
 		}
 	}
@@ -1561,10 +1628,99 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 
 	d.mu.Lock()
 	for _, t := range targets {
+		if !t.noAudio && t.session != nil && t.session.HasAudio() && !muted && t.audioVolume == 0 {
+			t.audioVolume = 50
+		}
 		t.audioMuted = muted
 	}
 	defer d.mu.Unlock()
 	return d.statusResponseLocked(true, "")
+}
+
+func (d *Daemon) handleSetVolume(req Request) Response {
+	d.audioControlMu.Lock()
+	defer d.audioControlMu.Unlock()
+	if req.Volume == nil || *req.Volume < 0 || *req.Volume > 100 {
+		return Response{OK: false, Error: "volume must be between 0 and 100"}
+	}
+	if req.Target == "" {
+		return Response{OK: false, Error: "volume requires a target"}
+	}
+
+	d.mu.Lock()
+	entry, ok := d.streams[req.Target]
+	if !ok || entry.state != StateStreaming || entry.noAudio || entry.session == nil || !entry.session.HasAudio() {
+		resp := d.statusResponseLocked(false, "audio is not streaming to "+req.Target)
+		d.mu.Unlock()
+		return resp
+	}
+	session := entry.session
+	volume := *req.Volume
+	muted := volume == 0
+	d.mu.Unlock()
+
+	if err := session.SetAudioVolume(volume, muted); err != nil {
+		d.mu.Lock()
+		resp := d.statusResponseLocked(false, "failed to update audio volume: "+err.Error())
+		d.mu.Unlock()
+		return resp
+	}
+
+	d.mu.Lock()
+	if d.streams[req.Target] == entry {
+		entry.audioVolume = volume
+		entry.audioMuted = muted
+	}
+	resp := d.statusResponseLocked(true, "")
+	d.mu.Unlock()
+	return resp
+}
+
+func (d *Daemon) handleSetFrozen(req Request, frozen bool) Response {
+	d.mu.Lock()
+
+	var targets []*activeStream
+	if req.Target != "" {
+		entry, ok := d.streams[req.Target]
+		if !ok {
+			state := d.overallStateLocked()
+			d.mu.Unlock()
+			return Response{OK: false, State: state, Error: "no active stream to " + req.Target}
+		}
+		targets = []*activeStream{entry}
+	} else {
+		for _, stream := range d.streams {
+			if stream.state == StateStreaming {
+				targets = append(targets, stream)
+			}
+		}
+	}
+
+	if len(targets) == 0 {
+		state := d.overallStateLocked()
+		d.mu.Unlock()
+		return Response{OK: false, State: state, Error: "no active stream"}
+	}
+	for _, stream := range targets {
+		if stream.state != StateStreaming || stream.session == nil {
+			state := d.overallStateLocked()
+			d.mu.Unlock()
+			return Response{OK: false, State: state, Error: "stream is not ready"}
+		}
+	}
+	for _, stream := range targets {
+		stream.session.SetFrozen(frozen)
+		stream.frozen = frozen
+	}
+	response := d.statusResponseLocked(true, "")
+	d.mu.Unlock()
+	return response
+}
+
+// Execute runs a control request in-process. Desktop clients use this to share
+// the daemon lifecycle without opening a second local control connection.
+func (d *Daemon) Execute(req Request) Response {
+	return d.handleRequest(req)
 }
 
 // detachAllLocked removes every active stream and capture group atomically and

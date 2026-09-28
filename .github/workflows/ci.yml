@@ -39,12 +39,28 @@ jobs:
           go-version-file: go.mod
 
       - name: Build doubletake
+        if: runner.os == 'Linux'
         shell: bash
-        run: go build -ldflags='-s -w' -o doubletake${{ matrix.exe }} ./cmd/doubletake
+        run: go build -ldflags='-s -w' -o doubletake ./cmd/doubletake
+
+      - name: Build DoubleTake desktop app
+        if: runner.os == 'Windows'
+        shell: bash
+        run: go build -ldflags='-s -w -H windowsgui' -o doubletake.exe ./cmd/doubletake-gui
+
+      - name: Build DoubleTake command line app
+        if: runner.os == 'Windows'
+        shell: bash
+        run: go build -ldflags='-s -w' -o doubletake-cli.exe ./cmd/doubletake
 
       - name: Build doubletake-ctl
         shell: bash
         run: go build -ldflags='-s -w' -o doubletake-ctl${{ matrix.exe }} ./cmd/doubletake-ctl
+
+      - name: Build DoubleTake test receiver
+        if: runner.os == 'Windows'
+        shell: bash
+        run: go build -ldflags='-s -w' -o doubletake-test-receiver.exe ./cmd/doubletake-test-receiver
 
       - name: Bundle manpages
         if: runner.os == 'Linux'
@@ -55,7 +71,9 @@ jobs:
           name: release-assets-${{ runner.os }}
           path: |
             doubletake${{ matrix.exe }}
+            doubletake-cli.exe
             doubletake-ctl${{ matrix.exe }}
+            doubletake-test-receiver.exe
             doubletake-manpages.tar.gz
 
   release:
@@ -93,10 +111,15 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          name: Double-Take Windows Port ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.RELEASE_NOTES }}
           files: |
             doubletake
             doubletake-ctl
             doubletake.exe
+            doubletake-cli.exe
             doubletake-ctl.exe
+            doubletake-test-receiver.exe
             doubletake-manpages.tar.gz
+            assets/doubletake-icon.png
+            assets/doubletake.ico

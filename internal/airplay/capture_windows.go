@@ -175,7 +175,7 @@ func ffmpegSupportsEncoder(ffmpegPath, encoder string) bool {
 	if cached, ok := ffmpegEncoderProbes.Load(key); ok {
 		return cached.(bool)
 	}
-	out, err := exec.Command(ffmpegPath, "-hide_banner", "-encoders").Output()
+	out, err := hideFFmpegWindow(exec.Command(ffmpegPath, "-hide_banner", "-encoders")).Output()
 	found := false
 	if err == nil {
 		for _, field := range strings.Fields(string(out)) {
@@ -202,6 +202,7 @@ func ffmpegHEVCHardwareAvailable(ffmpegPath string) bool {
 			"-f", "lavfi", "-i", "color=size=64x64:rate=1",
 			"-frames:v", "1", "-c:v", "hevc_nvenc", "-preset", "p4",
 			"-profile:v", "main10", "-pix_fmt", "p010le", "-f", "null", "-")
+		hideFFmpegWindow(cmd)
 		available = cmd.Run() == nil
 	}
 	ffmpegHEVCHardwareProbes.Store(ffmpegPath, available)
@@ -326,6 +327,7 @@ func startFFmpegProcess(ctx context.Context, name string, args []string, logPref
 	captureCtx, cancel := context.WithCancel(ctx)
 	dbg("[CAPTURE] %s %s", name, strings.Join(args, " "))
 	cmd := exec.CommandContext(captureCtx, name, args...)
+	hideFFmpegWindow(cmd)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

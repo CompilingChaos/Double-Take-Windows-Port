@@ -68,7 +68,7 @@ func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable 
 
 	switch requested {
 	case VideoCodecH264:
-		width, height := i.MirrorSize()
+		width, height := i.h264VideoCanvas()
 		return videoSelection{codec: VideoCodecH264, width: width, height: height, reason: "explicit H.264"}, nil
 	case VideoCodecHEVC:
 		width, height, err := i.videoCanvas(VideoCodecHEVC)
@@ -78,22 +78,40 @@ func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable 
 		return videoSelection{codec: VideoCodecHEVC, width: width, height: height, reason: "explicit HEVC"}, nil
 	case VideoCodecAuto:
 		if !automaticHEVCAvailable {
-			width, height := i.MirrorSize()
+			width, height := i.h264VideoCanvas()
 			return videoSelection{codec: VideoCodecH264, width: width, height: height, reason: "local hardware HEVC path unavailable"}, nil
 		}
 		if !i.supportsVideoCodec(VideoCodecHEVC) {
-			width, height := i.MirrorSize()
+			width, height := i.h264VideoCanvas()
 			return videoSelection{codec: VideoCodecH264, width: width, height: height, reason: "receiver lacks feature 42"}, nil
 		}
 		width, height, ok := i.highResolutionVideoCanvas()
 		if !ok {
-			width, height = i.MirrorSize()
+			width, height = i.h264VideoCanvas()
 			return videoSelection{codec: VideoCodecH264, width: width, height: height, reason: "receiver maximum does not exceed 1080p"}, nil
 		}
 		return videoSelection{codec: VideoCodecHEVC, width: width, height: height, reason: "feature 42, high-resolution maximum, and local hardware HEVC"}, nil
 	default:
 		panic("validated video codec has no selection policy")
 	}
+}
+
+// Macs advertise a larger maximum display than their 720p nominal screen size.
+// A 900p H.264 canvas improves desktop text without changing TV selection.
+func (i *ReceiverInfo) h264VideoCanvas() (int, int) {
+	width, height := i.MirrorSize()
+	if !isMacReceiver(i) {
+		return width, height
+	}
+	maximumW, maximumH := i.MaxVideoSize()
+	if maximumW <= 0 || maximumH <= 0 {
+		return width, height
+	}
+	higherW, higherH := fitVideoSize(maximumW, maximumH, 1600, 900)
+	if higherW*higherH > width*height {
+		return higherW, higherH
+	}
+	return width, height
 }
 
 // highResolutionVideoCanvas implements the high-resolution half of Apple's

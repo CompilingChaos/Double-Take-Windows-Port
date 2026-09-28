@@ -9,6 +9,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -16,6 +19,16 @@ var (
 	ffmpegPath string
 	ffmpegErr  error
 )
+
+// FFmpeg is a console program. A GUI parent would otherwise show a console
+// window for every capture or encoder probe.
+func hideFFmpegWindow(cmd *exec.Cmd) *exec.Cmd {
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: windows.CREATE_NO_WINDOW,
+	}
+	return cmd
+}
 
 // CheckFFmpeg verifies that Windows screen capture can start. FFmpeg beside
 // doubletake.exe takes priority over an installation found through PATH.

@@ -80,6 +80,26 @@ func (c *Client) UnmuteTarget(target string) (*daemon.Response, error) {
 	return c.send(daemon.Request{Cmd: "unmute", Target: target})
 }
 
+// Freeze holds the current picture on all active sessions.
+func (c *Client) Freeze() (*daemon.Response, error) {
+	return c.send(daemon.Request{Cmd: "freeze"})
+}
+
+// FreezeTarget holds the current picture on one receiver.
+func (c *Client) FreezeTarget(target string) (*daemon.Response, error) {
+	return c.send(daemon.Request{Cmd: "freeze", Target: target})
+}
+
+// Unfreeze resumes live video on all active sessions.
+func (c *Client) Unfreeze() (*daemon.Response, error) {
+	return c.send(daemon.Request{Cmd: "unfreeze"})
+}
+
+// UnfreezeTarget resumes live video on one receiver.
+func (c *Client) UnfreezeTarget(target string) (*daemon.Response, error) {
+	return c.send(daemon.Request{Cmd: "unfreeze", Target: target})
+}
+
 func (c *Client) send(req daemon.Request) (*daemon.Response, error) {
 	conn, err := net.DialTimeout(controlNetwork(), c.SocketPath, 5*time.Second)
 	if err != nil {

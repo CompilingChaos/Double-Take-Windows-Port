@@ -67,6 +67,31 @@ func TestAutomaticVideoSelectionRequiresReceiverMaximumAndLocalHardware(t *testi
 	}
 }
 
+func TestMacH264CanvasImprovesQualityWithoutChangingAppleTV(t *testing.T) {
+	displays := []DisplayInfo{{
+		WidthPixels: 1280, HeightPixels: 720,
+		WidthPixelsMax: 3840, HeightPixelsMax: 2160,
+	}}
+	for _, test := range []struct {
+		model        string
+		wantW, wantH int
+	}{
+		{model: "MacBookPro17,1", wantW: 1600, wantH: 900},
+		{model: "AppleTV14,1", wantW: 1280, wantH: 720},
+	} {
+		t.Run(test.model, func(t *testing.T) {
+			info := &ReceiverInfo{Model: test.model, Displays: displays}
+			selection, err := info.selectVideo(VideoCodecAuto, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if selection.codec != VideoCodecH264 || selection.width != test.wantW || selection.height != test.wantH {
+				t.Fatalf("selection = %s %dx%d, want H.264 %dx%d", selection.codec, selection.width, selection.height, test.wantW, test.wantH)
+			}
+		})
+	}
+}
+
 func TestAutomaticVideoSelectionCapsMaximumPreservingAspect(t *testing.T) {
 	info := &ReceiverInfo{
 		Features: uint64(1) << featureScreenMultiCodec,

@@ -74,6 +74,18 @@ func main() {
 		} else {
 			resp, err = client.Unmute()
 		}
+	case "freeze":
+		if len(args) >= 2 {
+			resp, err = client.FreezeTarget(args[1])
+		} else {
+			resp, err = client.Freeze()
+		}
+	case "unfreeze":
+		if len(args) >= 2 {
+			resp, err = client.UnfreezeTarget(args[1])
+		} else {
+			resp, err = client.Unfreeze()
+		}
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", cmd)
 		usage()
@@ -95,5 +107,5 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: doubletake-ctl [-socket endpoint] [-no-audio] <command> [args]\n\nCommands:\n  status                              Show daemon state and all active streams\n  discover                            Discover AirPlay devices on the network\n  devices                             List cached discovered devices\n  connect [target] [PIN-or-password]  Start mirroring (to target IP, or first free device)\n  pin <PIN-or-password>               Submit pairing credentials for a waiting device\n  disconnect [target]                 Stop mirroring (all streams, or only the given IP)\n  mute [target]                       Mute mirrored audio (all streams, or only the given IP)\n  unmute [target]                     Unmute mirrored audio (all streams, or only the given IP)\n\nFlags:\n  -socket endpoint                    Override daemon control endpoint (default: %s)\n  -no-audio                           Do not stream audio for a new connection\n", daemon.DefaultSocketPath())
+	fmt.Fprintf(os.Stderr, "Usage: doubletake-ctl [-socket endpoint] [-no-audio] <command> [args]\n\nCommands:\n  status                              Show daemon state and all active streams\n  discover                            Discover AirPlay devices on the network\n  devices                             List cached discovered devices\n  connect [target] [PIN-or-password]  Start mirroring (to target IP, or first free device)\n  pin <PIN-or-password>               Submit pairing credentials for a waiting device\n  disconnect [target]                 Stop mirroring (all streams, or only the given IP)\n  freeze [target]                     Hold the current picture\n  unfreeze [target]                   Resume live video\n  mute [target]                       Mute mirrored audio (all streams, or only the given IP)\n  unmute [target]                     Unmute mirrored audio (all streams, or only the given IP)\n\nFlags:\n  -socket endpoint                    Override daemon control endpoint (default: %s)\n  -no-audio                           Do not stream audio for a new connection\n", daemon.DefaultSocketPath())
 }

@@ -129,6 +129,26 @@ func TestPTPRequiresCapabilityVersionAndEncryption(t *testing.T) {
 	}
 }
 
+func TestMacUsesNTPWhileAppleTVKeepsPTP(t *testing.T) {
+	for _, test := range []struct {
+		model string
+		want  string
+	}{
+		{model: "MacBookPro17,1", want: timingProtocolNTP},
+		{model: "iMac21,1", want: timingProtocolNTP},
+		{model: "AppleTV14,1", want: timingProtocolPTP},
+	} {
+		t.Run(test.model, func(t *testing.T) {
+			info := receiverWithFeatures(featurePTP)
+			info.Model = test.model
+			info.SourceVersion = "980.71.1"
+			if got := mustCompatibility(t, &info, true).timing; got != test.want {
+				t.Fatalf("timing = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSupportsPTPSourceVersion(t *testing.T) {
 	for _, test := range []struct {
 		version string

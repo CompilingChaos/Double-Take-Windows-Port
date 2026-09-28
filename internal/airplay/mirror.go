@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -218,22 +219,49 @@ type MirrorSession struct {
 	videoCodec  VideoCodec
 	sessionURI  string // RTSP session URI for TEARDOWN
 
-	streamCipher       func([]byte) []byte // AES-CTR encryption
-	chachaCipher       cipher.AEAD         // ChaCha20-Poly1305 AEAD (nil = use AES-CTR)
-	chachaNonce        uint64              // per-frame nonce counter
-	frameSeq           uint32
-	lastFrameTimestamp uint64
-	lastSlowWriteLog   time.Time
-	firstFrameSent     chan struct{} // closed after first video frame is sent
-	latePTSReported    bool
-	timestampBias      time.Duration
-	frameClockNow      func() time.Time
-	timingProtocol     string
-	mediaClock         *mediaClock
+	streamCipher        func([]byte) []byte // AES-CTR encryption
+	chachaCipher        cipher.AEAD         // ChaCha20-Poly1305 AEAD (nil = use AES-CTR)
+	chachaNonce         uint64              // per-frame nonce counter
+	frameSeq            uint32
+	lastFrameTimestamp  uint64
+	lastSlowWriteLog    time.Time
+	firstFrameSent      chan struct{} // closed after first video frame is sent
+	latePTSReported     bool
+	timestampBias       time.Duration
+	frameClockNow       func() time.Time
+	timingProtocol      string
+	mediaClock          *mediaClock
+	frozen              atomic.Bool
+	resumeNeedsKeyframe atomic.Bool
 
 	// Audio
 	audioStream *AudioStream
 	noAudio     bool
+}
+
+// SetFrozen controls whether new video pictures are delivered to the receiver.
+// Capture and encoding continue while frozen so the source pipeline cannot
+// build a stale backlog. The receiver keeps presenting the last delivered
+// picture while the AirPlay heartbeat remains active.
+func (s *MirrorSession) SetFrozen(frozen bool) {
+	if s == nil {
+		return
+	}
+	if frozen {
+		s.frozen.Store(true)
+		return
+	}
+	if s.frozen.Load() {
+		// The encoder advanced its reference chain while frozen. Resume only on
+		// an independently decodable picture.
+		s.resumeNeedsKeyframe.Store(true)
+		s.frozen.Store(false)
+	}
+}
+
+// Frozen reports whether video delivery is currently paused on one picture.
+func (s *MirrorSession) Frozen() bool {
+	return s != nil && s.frozen.Load()
 }
 
 func selectAudioSecurityMode(encrypted bool) audioSecurityMode {
@@ -1203,6 +1231,14 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		if len(vclBuf) == 0 {
 			return nil
 		}
+		if s.frozen.Load() {
+			resetVCL()
+			return nil
+		}
+		if s.resumeNeedsKeyframe.Load() && !pendingKeyframe {
+			resetVCL()
+			return nil
+		}
 
 		// New sessions can attach mid-stream when using broadcast capture. Until we
 		// have an IDR plus current SPS/PPS, drop VCL units to avoid sending
@@ -1274,6 +1310,9 @@ func (s *MirrorSession) StreamFrames(ctx context.Context, capture *ScreenCapture
 		sendStart := time.Now()
 		if err := s.sendFrame(frameData, pendingKeyframe, packetTimestamp, packetTimeline); err != nil {
 			return fmt.Errorf("send %s: %w", keyframeStr, err)
+		}
+		if pendingKeyframe {
+			s.resumeNeedsKeyframe.Store(false)
 		}
 		if capture.frames == nil {
 			cc.recordSend(len(frameData)+128, time.Since(sendStart))
@@ -2276,21 +2315,35 @@ func (s *MirrorSession) HasAudio() bool {
 // SetAudioMuted updates mirrored audio volume on the receiver.
 // AirPlay uses SET_PARAMETER volume where 0 dB is max and -144 dB is muted.
 func (s *MirrorSession) SetAudioMuted(muted bool) error {
+	return s.SetAudioVolume(100, muted)
+}
+
+// SetAudioVolume sets the receiver's mirrored-audio gain. The volume is a
+// percentage of full scale; zero and muted both silence the receiver.
+func (s *MirrorSession) SetAudioVolume(volume int, muted bool) error {
 	if s == nil || s.client == nil || s.sessionURI == "" {
 		return fmt.Errorf("audio control unavailable")
 	}
+	if volume < 0 || volume > 100 {
+		return fmt.Errorf("audio volume %d is out of range", volume)
+	}
 
-	if _, _, err := s.client.rtspRequest("SET_PARAMETER", s.sessionURI, "text/parameters", audioVolumeBody(muted), nil); err != nil {
-		return fmt.Errorf("set audio muted=%t: %w", muted, err)
+	if _, _, err := s.client.rtspRequest("SET_PARAMETER", s.sessionURI, "text/parameters", audioVolumeBodyForLevel(volume, muted), nil); err != nil {
+		return fmt.Errorf("set audio volume=%d muted=%t: %w", volume, muted, err)
 	}
 	return nil
 }
 
 func audioVolumeBody(muted bool) []byte {
-	if muted {
+	return audioVolumeBodyForLevel(100, muted)
+}
+
+func audioVolumeBodyForLevel(volume int, muted bool) []byte {
+	if muted || volume == 0 {
 		return []byte("volume: -144.000000\r\n")
 	}
-	return []byte("volume: 0.000000\r\n")
+	decibels := -30 + 30*float64(volume)/100
+	return []byte(fmt.Sprintf("volume: %.6f\r\n", decibels))
 }
 
 // AudioStream returns the audio stream for this session (may be nil).

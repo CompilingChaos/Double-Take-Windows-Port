@@ -224,6 +224,12 @@ func (s *MirrorSession) streamHEVCFrames(ctx context.Context, capture *ScreenCap
 		if !hasVCL {
 			continue
 		}
+		if s.frozen.Load() {
+			continue
+		}
+		if s.resumeNeedsKeyframe.Load() && !keyframe {
+			continue
+		}
 		if !primed && (!keyframe || len(current[0]) == 0 || len(current[1]) == 0 || len(current[2]) == 0) {
 			continue
 		}
@@ -253,6 +259,9 @@ func (s *MirrorSession) streamHEVCFrames(ctx context.Context, capture *ScreenCap
 		}
 		if err := s.sendFrame(frame, keyframe, timestamp, timeline); err != nil {
 			return fmt.Errorf("send HEVC frame: %w", err)
+		}
+		if keyframe {
+			s.resumeNeedsKeyframe.Store(false)
 		}
 		if frameCount == 0 {
 			select {

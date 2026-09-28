@@ -25,9 +25,10 @@ const (
 	eRender  = 0
 	eConsole = 0
 
-	audclntSharemodeShared     = 0
-	audclntStreamflagsLoopback = 0x00020000
-	audclntBufferflagsSilent   = 0x00000002
+	audclntSharemodeShared           = 0
+	audclntStreamflagsLoopback       = 0x00020000
+	audclntStreamflagsAutoconvertPCM = 0x80000000
+	audclntBufferflagsSilent         = 0x00000002
 
 	waveFormatPCM           = 0x0001
 	waveFormatIEEEFloat     = 0x0003
@@ -121,11 +122,23 @@ type waveFormatEx struct {
 }
 
 type waveFormatExtensible struct {
-	waveFormatEx
-	Samples     uint16
-	ChannelMask uint32
-	SubFormat   windows.GUID
+	// WAVEFORMATEX occupies 18 bytes in the Windows ABI. Embedding the Go
+	// waveFormatEx struct would add trailing padding and shift SubFormat.
+	FormatTag      uint16
+	Channels       uint16
+	SamplesPerSec  uint32
+	AvgBytesPerSec uint32
+	BlockAlign     uint16
+	BitsPerSample  uint16
+	CbSize         uint16
+	Samples        uint16
+	ChannelMask    uint32
+	SubFormat      windows.GUID
 }
+
+// The native WAVEFORMATEXTENSIBLE SubFormat GUID begins at byte 24.
+var _ [24 - unsafe.Offsetof(waveFormatExtensible{}.SubFormat)]byte
+var _ [unsafe.Offsetof(waveFormatExtensible{}.SubFormat) - 24]byte
 
 type stereoSample struct {
 	left  float64
@@ -280,41 +293,35 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 	}
 	defer release(unsafe.Pointer(device))
 
-	client, err := device.activateAudioClient()
+	client, captureClient, formatPtr, freeFormat, err := openWindowsLoopbackCapture(device)
 	if err != nil {
 		ready <- err
 		return err
 	}
 	defer release(unsafe.Pointer(client))
-
-	formatPtr, err := client.getMixFormat()
-	if err != nil {
-		ready <- err
-		return err
+	defer release(unsafe.Pointer(captureClient))
+	if freeFormat {
+		defer procCoTaskMemFree.Call(uintptr(formatPtr))
 	}
-	defer procCoTaskMemFree.Call(uintptr(formatPtr))
-
 	format := (*waveFormatEx)(formatPtr)
 	formatDesc := describeWaveFormat(formatPtr)
 	dbg("[AUDIO] WASAPI mix format: %s", formatDesc)
-
-	if err := client.initialize(formatPtr); err != nil {
-		ready <- err
-		return err
-	}
-
-	captureClient, err := client.getCaptureService()
-	if err != nil {
-		ready <- err
-		return err
-	}
-	defer release(unsafe.Pointer(captureClient))
 
 	if err := client.start(); err != nil {
 		ready <- err
 		return err
 	}
-	defer client.stop()
+	restoreSpeakers, err := muteLocalSpeakers(device)
+	if err != nil {
+		client.stop()
+		muteErr := fmt.Errorf("mute local speakers: %w", err)
+		ready <- muteErr
+		return muteErr
+	}
+	defer func() {
+		client.stop()
+		restoreSpeakers()
+	}()
 
 	logged := false
 	ready <- nil
@@ -362,6 +369,57 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 			}
 		}
 	}
+}
+
+func openWindowsLoopbackCapture(device *iMMDevice) (*iAudioClient, *iAudioCaptureClient, unsafe.Pointer, bool, error) {
+	// Process loopback is independent of the physical endpoint's mute tap and
+	// captures all render streams except those from DoubleTake itself.
+	client, err := activateProcessLoopbackClient()
+	if err == nil {
+		// The virtual device does not implement GetMixFormat. Ask Windows to
+		// convert its mix to the same 44.1 kHz stereo PCM sent over AirPlay.
+		pcm := &waveFormatEx{FormatTag: waveFormatPCM, Channels: 2,
+			SamplesPerSec: 44100, AvgBytesPerSec: 176400,
+			BlockAlign: 4, BitsPerSample: 16}
+		formatPtr := unsafe.Pointer(pcm)
+		if err = client.initialize(formatPtr, true); err == nil {
+			var capture *iAudioCaptureClient
+			capture, err = client.getCaptureService()
+			if err == nil {
+				dbg("[AUDIO] using Windows process loopback")
+				return client, capture, formatPtr, false, nil
+			}
+		}
+		release(unsafe.Pointer(client))
+	}
+	dbg("[AUDIO] process loopback unavailable (%v); using endpoint loopback", err)
+
+	client, err = device.activateAudioClient()
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	formatPtr, err := client.getMixFormat()
+	if err != nil {
+		release(unsafe.Pointer(client))
+		return nil, nil, nil, false, err
+	}
+	if kind := waveAudioKind(formatPtr); kind != waveFormatPCM && kind != waveFormatIEEEFloat {
+		err = fmt.Errorf("unsupported WASAPI mix format: %s", describeWaveFormat(formatPtr))
+	} else {
+		err = client.initialize(formatPtr, false)
+	}
+	if err != nil {
+		procCoTaskMemFree.Call(uintptr(formatPtr))
+		release(unsafe.Pointer(client))
+		return nil, nil, nil, false, err
+	}
+	capture, err := client.getCaptureService()
+	if err != nil {
+		procCoTaskMemFree.Call(uintptr(formatPtr))
+		release(unsafe.Pointer(client))
+		return nil, nil, nil, false, err
+	}
+	return client, capture, formatPtr, true, nil
 }
 
 func coInitialize() (bool, error) {
@@ -431,11 +489,15 @@ func (c *iAudioClient) getMixFormat() (unsafe.Pointer, error) {
 	return ptr, nil
 }
 
-func (c *iAudioClient) initialize(format unsafe.Pointer) error {
+func (c *iAudioClient) initialize(format unsafe.Pointer, processLoopback bool) error {
+	flags := uintptr(audclntStreamflagsLoopback)
+	if processLoopback {
+		flags |= audclntStreamflagsAutoconvertPCM
+	}
 	hr, _, _ := syscall.SyscallN(c.lpVtbl.Initialize,
 		uintptr(unsafe.Pointer(c)),
 		audclntSharemodeShared,
-		audclntStreamflagsLoopback,
+		flags,
 		referenceTime100ms,
 		0,
 		uintptr(format),
@@ -644,11 +706,17 @@ func waveAudioKind(formatPtr unsafe.Pointer) uint16 {
 	if format.FormatTag != waveFormatExtensibleTag {
 		return format.FormatTag
 	}
+	if format.CbSize < 22 {
+		return 0
+	}
 	ext := (*waveFormatExtensible)(formatPtr)
 	if ext.SubFormat.Data1 == waveFormatIEEEFloat {
 		return waveFormatIEEEFloat
 	}
-	return waveFormatPCM
+	if ext.SubFormat.Data1 == waveFormatPCM {
+		return waveFormatPCM
+	}
+	return 0
 }
 
 func describeWaveFormat(formatPtr unsafe.Pointer) string {

@@ -28,6 +28,10 @@ type receiverCompatibility struct {
 	fairPlayRoots    fairPlayRootPlacement
 }
 
+func isMacReceiver(info *ReceiverInfo) bool {
+	return info != nil && strings.Contains(strings.ToLower(info.Model), "mac")
+}
+
 const (
 	// These bit numbers are AirPlay feature indices used by Apple's sender, not
 	// receiver fingerprints. Feature 41 advertises PTP and feature 59 advertises
@@ -83,7 +87,9 @@ func compatibilityForReceiver(info *ReceiverInfo, encrypted, audioEnabled bool) 
 	// channel. SourceVersion 377.40.x is a narrowly observed interoperability
 	// exception whose feature 41 advertisement does not yield a working PTP
 	// mirroring session.
-	if encrypted && info.HasFeature(featurePTP) && supportsPTPSourceVersion(info.SourceVersion) {
+	// macOS 26.6.2 accepts a PTP video session but presents only its first
+	// picture. Its NTP path presents the continuing frame stream.
+	if encrypted && info.HasFeature(featurePTP) && supportsPTPSourceVersion(info.SourceVersion) && !isMacReceiver(info) {
 		policy.timing = timingProtocolPTP
 	}
 
