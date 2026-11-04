@@ -67,16 +67,17 @@ func main() {
 	})
 	if hookErr != nil {
 		appBackend.setError(hookErr)
+	} else {
+		appBackend.hook = enterHook
+		defer enterHook.Close()
 	}
-	appBackend.hook = enterHook
 
-	defer enterHook.Close()
 	if err := appBackend.bind(w.Bind); err != nil {
 		showFatalWindow(err)
 		return
 	}
 
-	w.SetHtml(localizedHTML(true))
+	w.SetHtml(localizedHTML(appBackend.hook != nil))
 	w.Run()
 }
 
