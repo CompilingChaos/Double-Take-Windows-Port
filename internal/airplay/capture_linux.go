@@ -688,18 +688,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 		"session_handle_token": dbus.MakeVariant(baseToken + "_session"),
 	}
 
-	var requestHandle dbus.ObjectPath
-	call := portal.Call("org.freedesktop.portal.ScreenCast.CreateSession", 0, sessionOpts)
-	if call.Err != nil {
-		conn.Close()
-		return 0, nil, nil, "", fmt.Errorf("CreateSession: %w", call.Err)
-	}
-	if err := call.Store(&requestHandle); err != nil {
-		conn.Close()
-		return 0, nil, nil, "", fmt.Errorf("store create-session request handle: %w", err)
-	}
-
-	createResult, err := waitForResponseWithResult(ctx, conn, requestHandle)
+	createResult, err := callScreenCastRequest(ctx, conn, portal, "CreateSession", sessionOpts)
 	if err != nil {
 		conn.Close()
 		return 0, nil, nil, "", fmt.Errorf("session response: %w", err)
@@ -732,19 +721,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 		}
 	}
 
-	requestHandle = ""
-	call = portal.Call("org.freedesktop.portal.ScreenCast.SelectSources", 0,
-		sessionPath, selectOpts)
-	if call.Err != nil {
-		conn.Close()
-		return 0, nil, nil, "", fmt.Errorf("SelectSources: %w", call.Err)
-	}
-	if err := call.Store(&requestHandle); err != nil {
-		conn.Close()
-		return 0, nil, nil, "", fmt.Errorf("store select-sources request handle: %w", err)
-	}
-
-	if _, err = waitForResponseWithResult(ctx, conn, requestHandle); err != nil {
+	if _, err := callScreenCastRequest(ctx, conn, portal, "SelectSources", sessionPath, selectOpts); err != nil {
 		conn.Close()
 		return 0, nil, nil, "", fmt.Errorf("select response: %w", err)
 	}
@@ -754,19 +731,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 		"handle_token": dbus.MakeVariant(baseToken + "_start"),
 	}
 
-	requestHandle = ""
-	call = portal.Call("org.freedesktop.portal.ScreenCast.Start", 0,
-		sessionPath, "", startOpts)
-	if call.Err != nil {
-		conn.Close()
-		return 0, nil, nil, "", fmt.Errorf("Start: %w", call.Err)
-	}
-	if err := call.Store(&requestHandle); err != nil {
-		conn.Close()
-		return 0, nil, nil, "", fmt.Errorf("store start request handle: %w", err)
-	}
-
-	startResult, err := waitForResponseWithResult(ctx, conn, requestHandle)
+	startResult, err := callScreenCastRequest(ctx, conn, portal, "Start", sessionPath, "", startOpts)
 	if err != nil {
 		conn.Close()
 		return 0, nil, nil, "", fmt.Errorf("start response: %w", err)
@@ -825,7 +790,7 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 	// OpenPipeWireRemote returns a Unix fd for the portal's PipeWire remote.
 	// pipewiresrc MUST use this fd to connect; without it, it connects to the
 	// global PipeWire instance which does not have the portal node and returns EINVAL.
-	call = portal.Call("org.freedesktop.portal.ScreenCast.OpenPipeWireRemote", 0,
+	call := portal.CallWithContext(ctx, "org.freedesktop.portal.ScreenCast.OpenPipeWireRemote", 0,
 		sessionPath, map[string]dbus.Variant{})
 	if call.Err != nil {
 		conn.Close()
@@ -840,21 +805,46 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
 	return nodeID, os.NewFile(uintptr(pwFD), "pipewire-remote"), conn, newRestoreToken, nil
 }
 
-func waitForResponseWithResult(ctx context.Context, conn *dbus.Conn, requestHandle dbus.ObjectPath) (map[string]dbus.Variant, error) {
-	ch := make(chan *dbus.Signal, 1)
+func callScreenCastRequest(ctx context.Context, conn *dbus.Conn, portal dbus.BusObject, method string, args ...any) (map[string]dbus.Variant, error) {
+	// Subscribe before calling the method. CreateSession and SelectSources can
+	// emit their Response signal before returning the request handle.
+	ch := make(chan *dbus.Signal, 4)
 	conn.Signal(ch)
 	defer conn.RemoveSignal(ch)
 
-	matchRule := "type='signal',interface='org.freedesktop.portal.Request',member='Response'"
-	if call := conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, matchRule); call.Err != nil {
-		return nil, fmt.Errorf("add portal response match: %w", call.Err)
+	match := []dbus.MatchOption{
+		dbus.WithMatchSender("org.freedesktop.portal.Desktop"),
+		dbus.WithMatchInterface("org.freedesktop.portal.Request"),
+		dbus.WithMatchMember("Response"),
+		dbus.WithMatchPathNamespace("/org/freedesktop/portal/desktop/request"),
 	}
-	defer conn.BusObject().Call("org.freedesktop.DBus.RemoveMatch", 0, matchRule)
+	callCtx, cancelCall := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelCall()
+	if err := conn.AddMatchSignalContext(callCtx, match...); err != nil {
+		return nil, fmt.Errorf("subscribe to portal response: %w", err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = conn.RemoveMatchSignalContext(cleanupCtx, match...)
+	}()
+
+	var requestHandle dbus.ObjectPath
+	call := portal.CallWithContext(callCtx, "org.freedesktop.portal.ScreenCast."+method, 0, args...)
+	if err := call.Store(&requestHandle); err != nil {
+		return nil, fmt.Errorf("%s request: %w", method, err)
+	}
+	if method != "Start" {
+		ctx = callCtx
+	}
 
 	for {
 		select {
-		case sig := <-ch:
-			if sig == nil || sig.Path != requestHandle {
+		case sig, ok := <-ch:
+			if !ok {
+				return nil, fmt.Errorf("portal connection closed")
+			}
+			if sig == nil || sig.Path != requestHandle || sig.Name != "org.freedesktop.portal.Request.Response" {
 				continue
 			}
 			if len(sig.Body) < 2 {
@@ -874,7 +864,7 @@ func waitForResponseWithResult(ctx context.Context, conn *dbus.Conn, requestHand
 			return result, nil
 
 		case <-ctx.Done():
-			return nil, fmt.Errorf("timeout waiting for portal response: %w", ctx.Err())
+			return nil, fmt.Errorf("wait for portal response: %w", ctx.Err())
 		}
 	}
 }
