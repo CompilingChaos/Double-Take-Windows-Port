@@ -1,4 +1,4 @@
-.PHONY: all build doubletake doubletake-ctl doubletake-test-receiver doubletake-release doubletake-ctl-release doubletake-test-receiver-release manpages-release install install-man uninstall test clean
+.PHONY: all build desktop doubletake doubletake-ctl doubletake-test-receiver doubletake-release doubletake-ctl-release doubletake-test-receiver-release manpages-release install install-man uninstall test clean
 
 PREFIX ?= /usr/local
 MANDIR ?= $(PREFIX)/share/man
@@ -6,6 +6,9 @@ MANDIR ?= $(PREFIX)/share/man
 all: doubletake doubletake-ctl doubletake-test-receiver
 
 build: all
+
+desktop:
+	CGO_ENABLED=1 go build -tags desktop -o bin/doubletake-gui ./cmd/doubletake-gui
 
 doubletake:
 	go build -o bin/doubletake ./cmd/doubletake
@@ -32,6 +35,7 @@ test:
 	go test ./...
 
 install: all install-man
+	install -d $(PREFIX)/bin
 	install -m 755 bin/doubletake $(PREFIX)/bin/
 	install -m 755 bin/doubletake-ctl $(PREFIX)/bin/
 	install -m 755 bin/doubletake-test-receiver $(PREFIX)/bin/
