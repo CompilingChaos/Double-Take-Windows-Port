@@ -8,6 +8,7 @@ require (
 	github.com/grandcat/zeroconf v1.0.0
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/miekg/dns v1.1.62
+	github.com/tester305/webview_go v0.0.0-20260106181019-61663a8bc94d
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/crypto v0.31.0
 	golang.org/x/net v0.33.0

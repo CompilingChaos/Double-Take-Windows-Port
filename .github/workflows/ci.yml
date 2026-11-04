@@ -11,13 +11,23 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Install Linux capture and desktop test dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev gstreamer1.0-tools \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+      - name: Test Linux desktop bindings
+        if: runner.os == 'Linux'
+        run: go test -tags desktop ./cmd/doubletake-gui
       - name: Test
         shell: bash
         run: go test ./...
@@ -26,7 +36,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             exe: ""
           - os: windows-latest
             exe: ".exe"
@@ -38,12 +48,22 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev
+
       - name: Build doubletake
         if: runner.os == 'Linux'
         shell: bash
         run: go build -ldflags='-s -w' -o doubletake ./cmd/doubletake
 
-      - name: Build DoubleTake desktop app
+      - name: Build Linux desktop app
+        if: runner.os == 'Linux'
+        run: make desktop
+
+      - name: Build Windows desktop app
         if: runner.os == 'Windows'
         shell: bash
         run: go build -ldflags='-s -w -H windowsgui' -o doubletake.exe ./cmd/doubletake-gui
@@ -58,13 +78,25 @@ jobs:
         run: go build -ldflags='-s -w' -o doubletake-ctl${{ matrix.exe }} ./cmd/doubletake-ctl
 
       - name: Build DoubleTake test receiver
-        if: runner.os == 'Windows'
         shell: bash
-        run: go build -ldflags='-s -w' -o doubletake-test-receiver.exe ./cmd/doubletake-test-receiver
+        run: go build -ldflags='-s -w' -o doubletake-test-receiver${{ matrix.exe }} ./cmd/doubletake-test-receiver
 
       - name: Bundle manpages
         if: runner.os == 'Linux'
         run: make manpages-release
+
+      - name: Package Linux release
+        if: runner.os == 'Linux'
+        run: |
+          tar -czf doubletake-linux-amd64.tar.gz -C bin doubletake-gui -C "$GITHUB_WORKSPACE" \
+            doubletake doubletake-ctl doubletake-test-receiver doubletake-manpages.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: release-assets-linux
+          path: doubletake-linux-amd64.tar.gz
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
@@ -109,8 +141,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: Double-Take Windows Port ${{ github.ref_name }}
+          name: DoubleTake ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.RELEASE_NOTES }}
           files: |
+            doubletake-linux-amd64.tar.gz
             doubletake.exe
             doubletake-cli.exe

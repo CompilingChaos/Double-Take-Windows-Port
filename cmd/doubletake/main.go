@@ -67,7 +67,7 @@ func main() {
 	fps := flag.Int("fps", 30, "Frames per second")
 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
 	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic AirPlay policy)")
-	hwaccelHelp := "Hardware acceleration: auto, nvenc, vaapi, none"
+	hwaccelHelp := "Hardware acceleration: auto, nvenc, vaapi, openh264, none"
 	if runtime.GOOS == "windows" {
 		hwaccelHelp = "Hardware acceleration: auto, nvenc, none"
 	}

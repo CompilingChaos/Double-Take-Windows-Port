@@ -207,6 +207,7 @@
 
   <script>
     const locale = '__DOUBLETAKE_LOCALE__';
+    const globalFreeze = '__DOUBLETAKE_GLOBAL_FREEZE__' === 'true';
     const translations = {
       en: {
         brandSub: 'AirPlay Studio', discovering: 'Discovering receivers', nearby: 'Nearby',
@@ -233,7 +234,7 @@
         pairingSent: 'Pairing details sent.', couldNotDisconnect: 'Could not disconnect.',
         disconnected: 'Disconnected.', unfreezeArmed: 'Unfreeze armed. Press Enter in any app to resume.',
         freezeArmed: 'Freeze armed. Press Enter in any app to capture the frame.',
-        couldNotMute: 'Could not change mute state.', audioUnmuted: 'Audio unmuted.',
+        couldNotFreeze: 'Could not change the freeze state.', couldNotMute: 'Could not change mute state.', audioUnmuted: 'Audio unmuted.',
         audioMutedToast: 'Audio muted.', couldNotChangeVolume: 'Could not change volume.'
       },
       de: {
@@ -260,7 +261,7 @@
         pairingSent: 'Kopplungsdaten gesendet.', couldNotDisconnect: 'Trennen fehlgeschlagen.',
         disconnected: 'Verbindung getrennt.', unfreezeArmed: 'Fortsetzen aktiviert. Drücke in einer beliebigen App die Eingabetaste.',
         freezeArmed: 'Einfrieren aktiviert. Drücke in einer beliebigen App die Eingabetaste, um das Bild festzuhalten.',
-        couldNotMute: 'Stummschaltung konnte nicht geändert werden.', audioUnmuted: 'Ton eingeschaltet.',
+        couldNotFreeze: 'Der Einfrierzustand konnte nicht geändert werden.', couldNotMute: 'Stummschaltung konnte nicht geändert werden.', audioUnmuted: 'Ton eingeschaltet.',
         audioMutedToast: 'Ton stummgeschaltet.', couldNotChangeVolume: 'Lautstärke konnte nicht geändert werden.'
       }
     };
@@ -377,7 +378,7 @@
       if (!list.length) {
         $('main').innerHTML = `${sys}<div class="welcome"><div class="welcome-inner">
           <div class="orb">${icons.tv}</div>
-          <div class="shortcut"><kbd>Enter</kbd><span>${esc(tr('shortcut'))}</span></div>
+          ${globalFreeze ? `<div class="shortcut"><kbd>Enter</kbd><span>${esc(tr('shortcut'))}</span></div>` : `<p>${esc(tr('searching'))}</p>`}
         </div></div>`;
         freezeArmedTarget = null;
         freezeArmedAction = null;
@@ -528,6 +529,15 @@
     }
 
     async function freezeClicked(target, frozen) {
+      if (!globalFreeze) {
+        try {
+          const response = await setStreamFrozen(target, !frozen);
+          if (!response.ok) toast(response.error || tr('couldNotFreeze'), true);
+          else toast(tr(frozen ? 'videoResumed' : 'frameFrozen'));
+        } catch (err) { toast(String(err), true); }
+        await poll();
+        return;
+      }
       if (freezeArmedTarget === target) {
         freezeArmedTarget = null;
         freezeArmedAction = null;

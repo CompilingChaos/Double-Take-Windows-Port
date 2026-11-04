@@ -1,100 +1,101 @@
-# Double-Take Windows Port
+# DoubleTake
 
-This is a Windows port of the [original Doubletake project](https://github.com/omarroth/doubletake).
+DoubleTake mirrors your desktop and audio to Apple TV, Mac, and other
+compatible AirPlay receivers on your local network. It supports Linux Mint,
+Ubuntu, and Windows. This repository builds on the
+[original Doubletake project](https://github.com/omarroth/doubletake).
 
-For Linux, use the original repository instead of this Windows port.
+## Linux Mint and Ubuntu
 
-It mirrors the Windows desktop and audio to Apple TV, Mac, and other compatible
-AirPlay receivers. It handles receiver discovery, PIN pairing, encrypted media
-transport, video encoding, audio capture, saved credentials, and simultaneous
-connections.
+The Linux x86-64 release is built on Ubuntu 24.04 for Ubuntu 24.04 and newer
+and Linux Mint 22 and newer. Install the runtime packages:
 
-## Requirements
+```sh
+sudo apt install libwebkit2gtk-4.1-0 gstreamer1.0-tools \
+  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly pulseaudio-utils x11-xserver-utils
+```
 
-- Windows
-- Microsoft Edge WebView2 Runtime (normally already present on Windows 10 and 11)
-- FFmpeg installed and available on `PATH`, or `ffmpeg.exe` in the same folder as `doubletake.exe`
-- An AirPlay receiver on the same network
+On Wayland, also install `gstreamer1.0-pipewire` and use the ScreenCast portal
+for your desktop environment. Ubuntu GNOME uses `xdg-desktop-portal-gnome`.
+Choose the screen to share when the desktop prompts you. On X11, DoubleTake
+captures the primary screen. Audio capture uses the monitor of your default
+PulseAudio or PipeWire-Pulse output, and local playback continues while streaming.
 
-Install FFmpeg with WinGet:
+Extract `doubletake-linux-amd64.tar.gz` and run `./doubletake-gui` from your
+desktop session. Run `./doubletake` to use receiver discovery from the terminal.
+
+To build from source, install Go 1.25 or newer and run `make` to build the CLI,
+control tool, and test receiver in `bin/`. To also build the desktop app:
+
+```sh
+sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev
+make desktop
+./bin/doubletake-gui
+```
+
+## Windows
+
+Install Microsoft Edge WebView2 Runtime and FFmpeg. FFmpeg can be on `PATH` or
+next to the DoubleTake executables. Install FFmpeg with WinGet:
 
 ```powershell
 winget install --id Gyan.FFmpeg --exact
 ```
 
-## Run
+Extract the Windows release files to the same folder and open `doubletake.exe`.
+Run `.\doubletake-cli.exe` to use receiver discovery from PowerShell.
 
-Extract the release files to a folder and double-click `doubletake.exe` to open
-the desktop app. The app discovers nearby Apple TVs, lets you filter them by
-name, connects with receiver audio muted by default, and provides disconnect,
-freeze, and audio controls while streaming. It opens maximized.
+To build from source, install Go 1.25 or newer and run `.\build.ps1` in
+PowerShell. The app, CLI, control tool, and diagnostic receiver are built in
+`bin\`.
 
-Click **Freeze**, then press Enter once when you want to hold the current
-picture. Click **Unfreeze**, then press Enter once to resume live video. Enter
-works while another program is focused and still reaches that program normally.
-Press Escape in DoubleTake to cancel an armed freeze or unfreeze.
+On supported Windows versions, DoubleTake captures the system mix independently
+of the default speakers. It mutes the local playback endpoint during audio
+mirroring and restores its previous mute state when capture ends.
 
-For a video and audio session, use the speaker button to mute or unmute and the
-slider to set that receiver's volume. Moving the slider above 0% unmutes it.
-While DoubleTake mirrors audio, it mutes the local Windows playback endpoint
-and restores its previous mute state when the last audio capture ends.
-On supported Windows versions it captures the system mix through process
-loopback, which keeps AirPlay audio independent of the speaker mute control.
+## Desktop controls
 
-Select a receiver from the list.
+Choose a receiver and enter its pairing PIN or configured password if prompted.
+DoubleTake saves pairing credentials for later connections. Receiver audio
+starts muted. Use the speaker button or volume slider to enable it.
 
-The first connection may ask for the PIN shown on the receiver. Credentials are saved automatically for later connections.
+- **Linux** applies **Freeze** and **Unfreeze** when you click them.
+- **Windows** arms **Freeze** or **Unfreeze** when you click it. Press Enter once
+  from any app to apply it. Press Escape in DoubleTake to cancel an armed action.
 
-## If No Receiver Is Found
+## Command-line options
 
-Connect directly using the receiver's IP address:
+When discovery misses a receiver, connect directly using its address. The
+default AirPlay port is `7000`. Use `-port` for a different port, `-no-audio` for
+video only, and `-pair` to pair again. Run the CLI with `-help` for all options.
 
-The command-line version is also included as `doubletake-cli.exe`:
-
-```powershell
-.\doubletake-cli.exe -target 192.168.1.77
+```sh
+./doubletake -target 192.168.1.77 -no-audio
 ```
-
-The default AirPlay port is `7000`. Use `-port` if the receiver uses another port.
-
-## Disable Audio
-
-The desktop app connects with audio available but muted until you unmute it.
-To disable audio entirely in the command-line version:
 
 ```powershell
 .\doubletake-cli.exe -target 192.168.1.77 -no-audio
 ```
 
-## Pair Again
+For a receiver with a fixed password, set `DOUBLETAKE_CODE` in the CLI's
+environment before connecting.
 
-To force a new pairing:
+## Test without an Apple TV
 
-```powershell
-.\doubletake-cli.exe -target 192.168.1.77 -pair
+On Linux, run the bundled diagnostic receiver and the CLI in separate terminals:
+
+```sh
+./doubletake-test-receiver -profile appletv3 -listen 127.0.0.1:7000
+./doubletake -target 127.0.0.1 -port 7000 -test -no-audio
 ```
 
-For a receiver that uses a fixed password:
+On Windows, build from source and run these commands in separate PowerShell
+windows from the repository root:
 
 ```powershell
-$env:DOUBLETAKE_CODE = "your-password"
-.\doubletake-cli.exe -target 192.168.1.77
+.\bin\doubletake-test-receiver.exe -profile appletv3 -listen 127.0.0.1:7000
+.\bin\doubletake-cli.exe -target 127.0.0.1 -port 7000 -test -no-audio
 ```
 
-## Test Without an Apple TV
-
-Start the included diagnostic receiver by double-clicking `doubletake-test-receiver.exe`, or run it with these options:
-
-```powershell
-.\doubletake-test-receiver.exe -profile appletv3 -name "Test Apple TV" -listen 127.0.0.1:7000
-```
-
-Then run:
-
-```powershell
-.\doubletake-cli.exe -target 127.0.0.1 -port 7000 -test -no-audio
-```
-
-The test receiver reports protocol and packet statistics. It does not display video or play audio.
-
-Use `doubletake-cli.exe -help` for the complete command-line option list.
+The diagnostic receiver reports protocol activity and packet counts.
