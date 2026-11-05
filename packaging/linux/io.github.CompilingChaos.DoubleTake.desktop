@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=DoubleTake
+GenericName=AirPlay Screen Mirroring
+Comment=Mirror your screen and audio to an AirPlay receiver
+Exec=doubletake-gui
+TryExec=doubletake-gui
+Icon=io.github.CompilingChaos.DoubleTake
+Terminal=false
+Categories=AudioVideo;
+Keywords=AirPlay;Screen Mirroring;Screen Sharing;Apple TV;
+StartupWMClass=Doubletake-gui

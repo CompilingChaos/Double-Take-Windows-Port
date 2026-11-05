@@ -52,16 +52,16 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev desktop-file-utils
 
-      - name: Build doubletake
+      - name: Build Linux apps and Debian package
         if: runner.os == 'Linux'
-        shell: bash
-        run: go build -ldflags='-s -w' -o doubletake ./cmd/doubletake
-
-      - name: Build Linux desktop app
-        if: runner.os == 'Linux'
-        run: make desktop
+        run: |
+          version=0.0.0~dev
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version=${GITHUB_REF_NAME#v}
+          fi
+          make deb DEB_VERSION="$version"
 
       - name: Build Windows desktop app
         if: runner.os == 'Windows'
@@ -74,10 +74,12 @@ jobs:
         run: go build -ldflags='-s -w' -o doubletake-cli.exe ./cmd/doubletake
 
       - name: Build doubletake-ctl
+        if: runner.os == 'Windows'
         shell: bash
         run: go build -ldflags='-s -w' -o doubletake-ctl${{ matrix.exe }} ./cmd/doubletake-ctl
 
       - name: Build DoubleTake test receiver
+        if: runner.os == 'Windows'
         shell: bash
         run: go build -ldflags='-s -w' -o doubletake-test-receiver${{ matrix.exe }} ./cmd/doubletake-test-receiver
 
@@ -88,14 +90,18 @@ jobs:
       - name: Package Linux release
         if: runner.os == 'Linux'
         run: |
-          tar -czf doubletake-linux-amd64.tar.gz -C bin doubletake-gui -C "$GITHUB_WORKSPACE" \
-            doubletake doubletake-ctl doubletake-test-receiver doubletake-manpages.tar.gz
+          tar -czf doubletake-linux-amd64.tar.gz -C bin \
+            doubletake-gui doubletake doubletake-ctl doubletake-test-receiver \
+            -C "$GITHUB_WORKSPACE" doubletake-manpages.tar.gz
+          mv artifacts/doubletake-linux-amd64.deb .
 
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:
           name: release-assets-linux
-          path: doubletake-linux-amd64.tar.gz
+          path: |
+            doubletake-linux-amd64.deb
+            doubletake-linux-amd64.tar.gz
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
@@ -144,6 +150,7 @@ jobs:
           name: DoubleTake ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.RELEASE_NOTES }}
           files: |
+            doubletake-linux-amd64.deb
             doubletake-linux-amd64.tar.gz
             doubletake.exe
             doubletake-cli.exe

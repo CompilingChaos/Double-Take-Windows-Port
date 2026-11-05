@@ -7,8 +7,21 @@ Ubuntu, and Windows. This repository builds on the
 
 ## Linux Mint and Ubuntu
 
-The Linux x86-64 release is built on Ubuntu 24.04 for Ubuntu 24.04 and newer
-and Linux Mint 22 and newer. Install the runtime packages:
+The Linux x86-64 installer supports Ubuntu 24.04+ and Linux Mint 22+.
+Open `doubletake-linux-amd64.deb` with your package installer, or install it
+from a terminal:
+
+```sh
+sudo apt install ./doubletake-linux-amd64.deb
+```
+
+Installation adds **DoubleTake** to your application menu. Press the Windows
+(Super) key, type **DoubleTake**, and press Enter. Run `doubletake` in a
+terminal to use the CLI.
+
+The portable `doubletake-linux-amd64.tar.gz` archive can be extracted and run
+directly with `./doubletake-gui`. For the portable or source build, install the
+runtime dependencies:
 
 ```sh
 sudo apt install libwebkit2gtk-4.1-0 gstreamer1.0-tools \
@@ -22,17 +35,15 @@ Choose the screen to share when the desktop prompts you. On X11, DoubleTake
 captures the primary screen. Audio capture uses the monitor of your default
 PulseAudio or PipeWire-Pulse output, and local playback continues while streaming.
 
-Extract `doubletake-linux-amd64.tar.gz` and run `./doubletake-gui` from your
-desktop session. Run `./doubletake` to use receiver discovery from the terminal.
-
-To build from source, install Go 1.25 or newer and run `make` to build the CLI,
-control tool, and test receiver in `bin/`. To also build the desktop app:
+To install from source for your user, install Go 1.25+ and run:
 
 ```sh
-sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev
-make desktop
-./bin/doubletake-gui
+sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev desktop-file-utils
+make install PREFIX="$HOME/.local" DATADIR="${XDG_DATA_HOME:-$HOME/.local/share}"
 ```
+
+This also adds the application menu entry. Use `make uninstall` with the same
+`PREFIX` and `DATADIR` to remove the source installation.
 
 ## Windows
 
