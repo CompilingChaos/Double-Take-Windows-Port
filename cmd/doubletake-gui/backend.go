@@ -28,10 +28,11 @@ var appHTML string
 var appIcon []byte
 
 type backend struct {
-	daemon *daemon.Daemon
-	hook   freezeHook
-	mu     sync.RWMutex
-	err    string
+	daemon        *daemon.Daemon
+	hook          freezeHook
+	focusedFreeze freezeArm
+	mu            sync.RWMutex
+	err           string
 }
 
 type snapshot struct {
@@ -60,11 +61,7 @@ func (b *backend) systemMessage() string {
 func (b *backend) state() snapshot {
 	status := b.daemon.Execute(daemon.Request{Cmd: "status"})
 	devices := b.daemon.Execute(daemon.Request{Cmd: "devices"})
-	var target string
-	var frozen bool
-	if b.hook != nil {
-		target, frozen = b.hook.ArmedState()
-	}
+	target, frozen := b.freezeControl().ArmedState()
 	return snapshot{Status: status, Devices: devices.Devices, FreezeArmedTarget: target, FreezeArmedAction: frozen, SystemMessage: b.systemMessage()}
 }
 
@@ -82,7 +79,6 @@ func (b *backend) disconnect(target string) daemon.Response {
 }
 
 func (b *backend) setFrozen(target string, frozen bool) daemon.Response {
-	b.disarmFreeze(target)
 	cmd := "unfreeze"
 	if frozen {
 		cmd = "freeze"
@@ -91,16 +87,10 @@ func (b *backend) setFrozen(target string, frozen bool) daemon.Response {
 }
 
 func (b *backend) armFreeze(target string, frozen bool) error {
-	if b.hook == nil {
-		if systemUILocale() == "de" {
-			return fmt.Errorf("globale Eingabetaste ist nicht verfügbar: %s", b.systemMessage())
-		}
-		return fmt.Errorf("global Enter keyboard hook is unavailable: %s", b.systemMessage())
-	}
 	status := b.daemon.Execute(daemon.Request{Cmd: "status"})
 	for _, stream := range status.Streams {
 		if stream.DeviceIP == target && stream.State == daemon.StateStreaming && stream.Frozen != frozen {
-			return b.hook.Arm(target, frozen)
+			return b.freezeControl().Arm(target, frozen)
 		}
 	}
 	if systemUILocale() == "de" {
@@ -121,9 +111,32 @@ func (b *backend) setMuted(target string, muted bool) daemon.Response {
 	return b.daemon.Execute(daemon.Request{Cmd: cmd, Target: target})
 }
 
-func (b *backend) disarmFreeze(target string) {
+func (b *backend) freezeControl() freezeHook {
 	if b.hook != nil {
-		b.hook.Disarm(target)
+		return b.hook
+	}
+	return &b.focusedFreeze
+}
+
+func (b *backend) disarmFreeze(target string) {
+	b.freezeControl().Disarm(target)
+}
+
+func (b *backend) applyArmedFreeze(target string, frozen bool) {
+	response := b.setFrozen(target, frozen)
+	if response.OK {
+		return
+	}
+	if systemUILocale() == "de" {
+		b.setError(fmt.Errorf("Einfrierzustand für %s konnte nicht geändert werden: %s", target, response.Error))
+	} else {
+		b.setError(fmt.Errorf("change freeze state for %s: %s", target, response.Error))
+	}
+}
+
+func (b *backend) focusedEnter() {
+	if target, frozen := b.focusedFreeze.take(); target != "" {
+		b.applyArmedFreeze(target, frozen)
 	}
 }
 
@@ -174,7 +187,7 @@ func (b *backend) bind(bind func(string, any) error) error {
 		{"disconnectDevice", b.disconnect},
 		{"setStreamVolume", b.setVolume},
 		{"setStreamMuted", b.setMuted},
-		{"setStreamFrozen", b.setFrozen},
+		{"focusedEnter", b.focusedEnter},
 		{"armGlobalFreeze", b.armFreeze},
 		{"disarmGlobalFreeze", b.disarmFreeze},
 	} {

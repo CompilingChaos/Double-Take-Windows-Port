@@ -219,6 +219,8 @@
         shortcut: 'freezes or resumes from any app after you arm the control',
         armFreeze: 'Press Enter in any app to freeze. Press Esc here to cancel.',
         armUnfreeze: 'Press Enter in any app to resume live video. Press Esc here to cancel.',
+        armFreezeHere: 'Press Enter in DoubleTake to freeze. Press Esc to cancel.',
+        armUnfreezeHere: 'Press Enter in DoubleTake to resume. Press Esc to cancel.',
         pressEnter: 'Press Enter…', freeze: 'Freeze', unfreeze: 'Unfreeze',
         unmuteAudio: 'Unmute audio', muteAudio: 'Mute audio', unmute: 'Unmute', mute: 'Mute',
         audioMuted: 'Audio muted', streamVolume: 'Stream volume', volumeFor: name => `Volume for ${name}`,
@@ -232,9 +234,8 @@
         yourAppleTV: 'your Apple TV', password: 'Password', pairingCode: 'Pairing code',
         cancel: 'Cancel', continue: 'Continue', pairingFailed: 'Pairing failed.',
         pairingSent: 'Pairing details sent.', couldNotDisconnect: 'Could not disconnect.',
-        disconnected: 'Disconnected.', unfreezeArmed: 'Unfreeze armed. Press Enter in any app to resume.',
-        freezeArmed: 'Freeze armed. Press Enter in any app to capture the frame.',
-        couldNotFreeze: 'Could not change the freeze state.', couldNotMute: 'Could not change mute state.', audioUnmuted: 'Audio unmuted.',
+        disconnected: 'Disconnected.',
+        couldNotMute: 'Could not change mute state.', audioUnmuted: 'Audio unmuted.',
         audioMutedToast: 'Audio muted.', couldNotChangeVolume: 'Could not change volume.'
       },
       de: {
@@ -246,6 +247,8 @@
         shortcut: 'friert das Bild ein oder setzt es fort, nachdem du die Taste aktiviert hast',
         armFreeze: 'Drücke in einer beliebigen App die Eingabetaste, um das Bild einzufrieren. Mit Esc hier abbrechen.',
         armUnfreeze: 'Drücke in einer beliebigen App die Eingabetaste, um das Livebild fortzusetzen. Mit Esc hier abbrechen.',
+        armFreezeHere: 'Drücke in DoubleTake die Eingabetaste, um das Bild einzufrieren. Mit Esc abbrechen.',
+        armUnfreezeHere: 'Drücke in DoubleTake die Eingabetaste, um das Livebild fortzusetzen. Mit Esc abbrechen.',
         pressEnter: 'Eingabetaste drücken…', freeze: 'Einfrieren', unfreeze: 'Fortsetzen',
         unmuteAudio: 'Ton einschalten', muteAudio: 'Ton stummschalten', unmute: 'Ton an', mute: 'Stumm',
         audioMuted: 'Ton stummgeschaltet', streamVolume: 'Lautstärke', volumeFor: name => `Lautstärke für ${name}`,
@@ -259,9 +262,8 @@
         yourAppleTV: 'deinem Apple TV', password: 'Passwort', pairingCode: 'Kopplungscode',
         cancel: 'Abbrechen', continue: 'Weiter', pairingFailed: 'Kopplung fehlgeschlagen.',
         pairingSent: 'Kopplungsdaten gesendet.', couldNotDisconnect: 'Trennen fehlgeschlagen.',
-        disconnected: 'Verbindung getrennt.', unfreezeArmed: 'Fortsetzen aktiviert. Drücke in einer beliebigen App die Eingabetaste.',
-        freezeArmed: 'Einfrieren aktiviert. Drücke in einer beliebigen App die Eingabetaste, um das Bild festzuhalten.',
-        couldNotFreeze: 'Der Einfrierzustand konnte nicht geändert werden.', couldNotMute: 'Stummschaltung konnte nicht geändert werden.', audioUnmuted: 'Ton eingeschaltet.',
+        disconnected: 'Verbindung getrennt.',
+        couldNotMute: 'Stummschaltung konnte nicht geändert werden.', audioUnmuted: 'Ton eingeschaltet.',
         audioMutedToast: 'Ton stummgeschaltet.', couldNotChangeVolume: 'Lautstärke konnte nicht geändert werden.'
       }
     };
@@ -384,7 +386,7 @@
         freezeArmedAction = null;
         return;
       }
-      const banner = freezeArmedTarget ? `<div class="freeze-banner"><span>${esc(tr(freezeArmedAction ? 'armFreeze' : 'armUnfreeze'))}</span><kbd>Enter</kbd><kbd>Esc</kbd></div>` : '';
+      const banner = freezeArmedTarget ? `<div class="freeze-banner"><span>${esc(tr((freezeArmedAction ? 'armFreeze' : 'armUnfreeze') + (globalFreeze ? '' : 'Here')))}</span><kbd>Enter</kbd><kbd>Esc</kbd></div>` : '';
       const cards = list.map(s => {
         const [label, cls, indicator] = stateLabel(s);
         const ready = s.state === 'streaming';
@@ -529,15 +531,6 @@
     }
 
     async function freezeClicked(target, frozen) {
-      if (!globalFreeze) {
-        try {
-          const response = await setStreamFrozen(target, !frozen);
-          if (!response.ok) toast(response.error || tr('couldNotFreeze'), true);
-          else toast(tr(frozen ? 'videoResumed' : 'frameFrozen'));
-        } catch (err) { toast(String(err), true); }
-        await poll();
-        return;
-      }
       if (freezeArmedTarget === target) {
         freezeArmedTarget = null;
         freezeArmedAction = null;
@@ -551,7 +544,6 @@
         freezeArmedTarget = target;
         freezeArmedAction = !frozen;
         renderMain();
-        toast(tr(frozen ? 'unfreezeArmed' : 'freezeArmed'));
       } catch (err) { toast(String(err), true); }
     }
 
@@ -579,6 +571,10 @@
     $('credentialInput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.stopPropagation(); sendCredential(); } });
     document.addEventListener('keydown', e => {
       if ($('credentialModal').classList.contains('open')) return;
+      if (e.key === 'Enter' && freezeArmedTarget) {
+        if (!globalFreeze || e.target.closest('.freeze-control')) e.preventDefault();
+        if (!globalFreeze && !e.repeat) void focusedEnter();
+      }
       if (e.key === 'Escape' && freezeArmedTarget) {
         const target = freezeArmedTarget;
         freezeArmedTarget = null;

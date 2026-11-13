@@ -24,7 +24,7 @@ directly with `./doubletake-gui`. For the portable or source build, install the
 runtime dependencies:
 
 ```sh
-sudo apt install libwebkit2gtk-4.1-0 gstreamer1.0-tools \
+sudo apt install libwebkit2gtk-4.1-0 libxi6 gstreamer1.0-tools \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly pulseaudio-utils x11-xserver-utils
 ```
@@ -38,7 +38,7 @@ PulseAudio or PipeWire-Pulse output, and local playback continues while streamin
 To install from source for your user, install Go 1.25+ and run:
 
 ```sh
-sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev desktop-file-utils
+sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev libxi-dev desktop-file-utils
 make install PREFIX="$HOME/.local" DATADIR="${XDG_DATA_HOME:-$HOME/.local/share}"
 ```
 
@@ -71,9 +71,9 @@ Choose a receiver and enter its pairing PIN or configured password if prompted.
 DoubleTake saves pairing credentials for later connections. Receiver audio
 starts muted. Use the speaker button or volume slider to enable it.
 
-- **Linux** applies **Freeze** and **Unfreeze** when you click them.
-- **Windows** arms **Freeze** or **Unfreeze** when you click it. Press Enter once
-  from any app to apply it. Press Escape in DoubleTake to cancel an armed action.
+Click **Freeze** or **Unfreeze**, then press **Enter** to apply it. On Windows
+and Linux X11, Enter works while another app has focus. On Wayland, press
+Enter in the DoubleTake window. Press Escape in DoubleTake to cancel.
 
 ## Command-line options
 

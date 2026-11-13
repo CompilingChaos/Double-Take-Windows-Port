@@ -55,16 +55,7 @@ func main() {
 	maximizeWindow(w.Window())
 	stop := appBackend.start()
 	defer stop()
-	enterHook, hookErr := newGlobalEnterHook(func(target string, frozen bool) {
-		response := appBackend.setFrozen(target, frozen)
-		if !response.OK {
-			if systemUILocale() == "de" {
-				appBackend.setError(fmt.Errorf("Einfrierzustand für %s konnte nicht geändert werden: %s", target, response.Error))
-			} else {
-				appBackend.setError(fmt.Errorf("change freeze state for %s: %s", target, response.Error))
-			}
-		}
-	})
+	enterHook, hookErr := newGlobalEnterHook(appBackend.applyArmedFreeze)
 	if hookErr != nil {
 		appBackend.setError(hookErr)
 	} else {

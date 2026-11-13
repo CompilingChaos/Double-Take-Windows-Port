@@ -8,6 +8,7 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // StartAudioCapture launches a pipeline that captures system audio and feeds
@@ -25,16 +26,23 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 		srcArgs = []string{"audiotestsrc", "wave=sine", "freq=440", "is-live=true",
 			fmt.Sprintf("samplesperbuffer=%d", codecSPF)}
 		dbg("[AUDIO] using test tone (440 Hz sine wave, live, spf=%d)", codecSPF)
-	} else if exec.Command("gst-inspect-1.0", "pulsesrc").Run() == nil {
-		monitor := detectPulseMonitor()
+	} else if hasGstElement("pulsesrc") {
+		monitor := detectPulseMonitor(ctx)
 		if monitor == "" {
 			cancel()
 			return nil, fmt.Errorf("no PulseAudio monitor source found")
 		}
-		srcArgs = []string{"pulsesrc", fmt.Sprintf("device=%s", monitor)}
+		// Ask the sound server for roughly one codec frame per callback.
+		// Keep enough capacity in its ring to absorb a scheduler stall.
+		fragmentMicros := (codecSPF*int64(time.Second/time.Microsecond) + audioSampleRate - 1) / audioSampleRate
+		srcArgs = []string{
+			"pulsesrc", "device=" + monitor,
+			fmt.Sprintf("buffer-time=%d", audioCaptureStallBuffer/time.Microsecond),
+			fmt.Sprintf("latency-time=%d", fragmentMicros),
+		}
 		dbg("[AUDIO] using pulsesrc device=%s", monitor)
-	} else if exec.Command("gst-inspect-1.0", "pipewiresrc").Run() == nil {
-		srcArgs = []string{"pipewiresrc"}
+	} else if hasGstElement("pipewiresrc") {
+		srcArgs = []string{"pipewiresrc", "client-name=doubletake"}
 		dbg("[AUDIO] using pipewiresrc")
 	} else {
 		cancel()
@@ -99,8 +107,8 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 	return ac, nil
 }
 
-func detectPulseMonitor() string {
-	out, err := exec.Command("pactl", "get-default-sink").Output()
+func detectPulseMonitor(ctx context.Context) string {
+	out, err := exec.CommandContext(ctx, "pactl", "get-default-sink").Output()
 	if err != nil {
 		dbg("[AUDIO] pactl get-default-sink failed: %v", err)
 		return ""

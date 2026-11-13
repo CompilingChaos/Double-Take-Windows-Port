@@ -4,7 +4,7 @@ Architecture: @ARCH@
 Maintainer: CompilingChaos <251788823+CompilingChaos@users.noreply.github.com>
 Section: video
 Priority: optional
-Depends: libc6 (>= 2.34), libwebkit2gtk-4.1-0, gstreamer1.0-tools, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, pulseaudio-utils
+Depends: libc6 (>= 2.34), libwebkit2gtk-4.1-0, libxi6, gstreamer1.0-tools, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-plugins-ugly, pulseaudio-utils
 Recommends: gstreamer1.0-pipewire, x11-xserver-utils
 Homepage: https://github.com/CompilingChaos/Double-Take-Windows-Port
 Description: AirPlay desktop and audio mirroring

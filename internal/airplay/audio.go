@@ -127,7 +127,7 @@ type AudioCapture struct {
 var audioTimestampFallbackWarning sync.Once
 
 func supportsTimestampedAudioOutput() bool {
-	for _, element := range []string{"rtpL16pay", "rtponviftimestamp", "rtpstreampay"} {
+	for _, element := range []string{"audiobuffersplit", "rtpL16pay", "rtponviftimestamp", "rtpstreampay"} {
 		if !hasGstElement(element) {
 			return false
 		}
@@ -150,6 +150,10 @@ func audioCapturePipelineArgs(srcArgs []string, codec AudioCodec, timestamped bo
 		"!", fmt.Sprintf("audio/x-raw,rate=%d,channels=%d,format=%s,layout=interleaved", audioSampleRate, audioChannels, format),
 	)
 	if timestamped {
+		// Align the capture buffers to complete codec frames before RTP framing.
+		// This keeps sound-server callback boundaries out of the RTP sample clock.
+		args = append(args, "!", "audiobuffersplit",
+			fmt.Sprintf("output-buffer-duration=%d/%d", codecSPF, audioSampleRate), "strict-buffer-size=true")
 		// Preserve complete source samples through short CPU/GPU scheduling stalls.
 		// The timestamp-aware Go reader can then discard only codec frames whose
 		// negotiated playout deadline has actually passed.
@@ -958,11 +962,11 @@ func audioLatencyDuration(samples uint32) time.Duration {
 	return audioSamplesDuration(uint64(samples))
 }
 
-func audioFrameIsStale(pts, now time.Time, latencySamples uint32) bool {
+func audioFrameIsStale(pts, now time.Time, latencySamples uint32, sendLead time.Duration) bool {
 	if pts.IsZero() || now.IsZero() {
 		return false
 	}
-	return !pts.Add(audioLatencyDuration(latencySamples)).After(now.Add(minimumAudioSendLead))
+	return !pts.Add(audioLatencyDuration(latencySamples)).After(now.Add(sendLead))
 }
 
 func (as *AudioStream) Close() {
@@ -1049,7 +1053,7 @@ videoReady:
 			}
 			return fmt.Errorf("audio read first frame: %w", err)
 		}
-		if firstFrameSize > 0 && audioFrameIsStale(firstFramePosition.PTS, time.Now(), audioStream.latencySamples) {
+		if firstFrameSize > 0 && audioFrameIsStale(firstFramePosition.PTS, time.Now(), audioStream.latencySamples, minimumAudioSendLead) {
 			catchupFrames++
 			if catchupFrames >= maximumInitialCatchupFrames {
 				age := time.Since(firstFramePosition.PTS)
@@ -1102,7 +1106,10 @@ videoReady:
 					continue
 				}
 				announceMu.Lock()
-				rtpNow, announcedAt, ok := rtpClock.latestBoundary()
+				// Use one host instant for the RTP and network clocks, avoiding
+				// periodic jumps caused by rounding to a codec-frame boundary.
+				announcedAt := time.Now()
+				rtpNow, ok := rtpClock.rtpAt(announcedAt)
 				if !ok {
 					announceMu.Unlock()
 					continue
@@ -1210,7 +1217,9 @@ videoReady:
 			framePTS = firstFramePosition.PTS.Add(audioSamplesDuration(uint64(frameCount) * uint64(spf)))
 			framePosition.PTS = framePTS
 		}
-		if !usingFirstFrame && timestampedAudio && audioFrameIsStale(framePTS, time.Now(), audioStream.latencySamples) {
+		// A frame whose playout time is still ahead can arrive during catch-up.
+		// Dropping it early leaves a gap in the receiver's audio.
+		if !usingFirstFrame && timestampedAudio && audioFrameIsStale(framePTS, time.Now(), audioStream.latencySamples, 0) {
 			staleFrames++
 			if staleFrames == 1 || staleFrames%100 == 0 {
 				dbg("[AUDIO] dropping stale source frame %v old (latency=%v, dropped=%d)",
