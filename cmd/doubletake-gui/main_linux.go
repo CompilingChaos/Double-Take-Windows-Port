@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	webview "github.com/tester305/webview_go"
+	webview "github.com/samcharles93/webview_go"
 )
 
 func main() {
@@ -21,13 +21,19 @@ func main() {
 
 func run() error {
 	w := webview.New(false)
-	if w.Window() == nil {
+	if w == nil {
 		return fmt.Errorf("could not open the DoubleTake window; run it from an X11 or Wayland desktop session")
 	}
 	defer w.Destroy()
-	w.SetTitle("DoubleTake")
-	w.SetSize(1120, 760, webview.HintNone)
-	w.SetSize(920, 640, webview.HintMin)
+	if err := w.SetTitle("DoubleTake"); err != nil {
+		return fmt.Errorf("set window title: %w", err)
+	}
+	if err := w.SetSize(1120, 760, webview.HintNone); err != nil {
+		return fmt.Errorf("set window size: %w", err)
+	}
+	if err := w.SetSize(920, 640, webview.HintMin); err != nil {
+		return fmt.Errorf("set minimum window size: %w", err)
+	}
 
 	dir, err := os.MkdirTemp("", "doubletake-")
 	if err != nil {
@@ -49,9 +55,10 @@ func run() error {
 	}
 	stop := app.start()
 	defer stop()
-	w.SetHTML(localizedHTML(false))
-	w.Run()
-	return nil
+	if err := w.SetHtml(localizedHTML(false)); err != nil {
+		return fmt.Errorf("load desktop interface: %w", err)
+	}
+	return w.Run()
 }
 
 func systemUILocale() string {
