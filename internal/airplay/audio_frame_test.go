@@ -15,6 +15,7 @@ func TestAudioCapturePipelineUsesTimestampedFramingWhenAvailable(t *testing.T) {
 	args := strings.Join(audioCapturePipelineArgs([]string{"audiotestsrc"}, AudioCodecALAC, true), " ")
 	for _, want := range []string{
 		"format=S16BE",
+		"audiobuffersplit output-buffer-duration=352/44100 strict-buffer-size=true",
 		"queue max-size-buffers=0 max-size-bytes=0 max-size-time=250000000 leaky=no",
 		"rtpL16pay pt=96 mtu=60000 timestamp-offset=0 seqnum-offset=0 perfect-rtptime=true",
 		"rtponviftimestamp ntp-offset=-1 set-e-bit=false set-t-bit=false",
@@ -35,7 +36,7 @@ func TestAudioCapturePipelineUsesTimestampedFramingWhenAvailable(t *testing.T) {
 	if !strings.Contains(raw, "queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream") {
 		t.Fatalf("raw fallback pipeline %q does not retain its bounded no-PTS drop policy", raw)
 	}
-	for _, unwanted := range []string{"rtpL16pay", "rtponviftimestamp", "rtpstreampay"} {
+	for _, unwanted := range []string{"audiobuffersplit", "rtpL16pay", "rtponviftimestamp", "rtpstreampay"} {
 		if strings.Contains(raw, unwanted) {
 			t.Fatalf("raw fallback pipeline %q unexpectedly contains %q", raw, unwanted)
 		}
@@ -229,12 +230,10 @@ func TestAudioRTPClockUsesCapturedSampleClockWithoutLongTermWallDrift(t *testing
 	if wallDerived := epoch + uint32(durationToAudioSamples(elapsedWall)); wallDerived == last {
 		t.Fatal("test clock did not create a measurable wall/sample-rate difference")
 	}
-	latestRTP, latestPTS, ok := clock.latestBoundary()
-	wantBoundaryRTP := last + 352
-	wantBoundaryPTS := lastPosition.PTS.Add(audioSamplesDuration(352))
-	if !ok || latestRTP != wantBoundaryRTP || !latestPTS.Equal(wantBoundaryPTS) {
-		t.Fatalf("latest correlation = rtp %#x pts %v ok=%t, want %#x %v true",
-			latestRTP, latestPTS, ok, wantBoundaryRTP, wantBoundaryPTS)
+	announcedAt := lastPosition.PTS.Add(5 * time.Millisecond)
+	wantRTP := last + uint32(durationToAudioSamples(5*time.Millisecond))
+	if got, ok := clock.rtpAt(announcedAt); !ok || got != wantRTP {
+		t.Fatalf("RTP announce = %#x ok=%t, want %#x true", got, ok, wantRTP)
 	}
 }
 
@@ -297,13 +296,17 @@ func TestSendSyncPacketAtUsesExplicitSourceRTP(t *testing.T) {
 func TestAudioFrameStalenessRequiresPositivePlayoutLead(t *testing.T) {
 	now := time.Unix(1787357100, 0)
 	const latency = uint32(4410) // 100 ms at 44.1 kHz
-	if audioFrameIsStale(now.Add(-90*time.Millisecond), now, latency) {
+	if audioFrameIsStale(now.Add(-90*time.Millisecond), now, latency, 0) {
 		t.Fatal("frame with 10ms remaining lead was classified stale")
 	}
-	if !audioFrameIsStale(now.Add(-100*time.Millisecond), now, latency) {
+	nearDeadline := now.Add(-97 * time.Millisecond)
+	if audioFrameIsStale(nearDeadline, now, latency, 0) || !audioFrameIsStale(nearDeadline, now, latency, minimumAudioSendLead) {
+		t.Fatal("a frame with 3ms remaining should be sent during playback and skipped at startup")
+	}
+	if !audioFrameIsStale(now.Add(-100*time.Millisecond), now, latency, 0) {
 		t.Fatal("frame with no remaining lead was not classified stale")
 	}
-	if audioFrameIsStale(time.Time{}, now, latency) {
+	if audioFrameIsStale(time.Time{}, now, latency, 0) {
 		t.Fatal("raw fallback frame with no PTS was classified stale")
 	}
 }

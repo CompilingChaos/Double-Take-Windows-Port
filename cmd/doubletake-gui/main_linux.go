@@ -50,12 +50,19 @@ func run() error {
 			break
 		}
 	}
+	stop := app.start()
+	defer stop()
+	enterHook, hookErr := newGlobalEnterHook(app.applyArmedFreeze)
+	if hookErr != nil {
+		log.Printf("global Enter unavailable: %v", hookErr)
+	} else if enterHook != nil {
+		app.hook = enterHook
+		defer enterHook.Close()
+	}
 	if err := app.bind(w.Bind); err != nil {
 		return err
 	}
-	stop := app.start()
-	defer stop()
-	if err := w.SetHtml(localizedHTML(false)); err != nil {
+	if err := w.SetHtml(localizedHTML(app.hook != nil)); err != nil {
 		return fmt.Errorf("load desktop interface: %w", err)
 	}
 	return w.Run()

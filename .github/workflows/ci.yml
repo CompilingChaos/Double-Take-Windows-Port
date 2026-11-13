@@ -22,7 +22,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev xvfb gstreamer1.0-tools \
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxi-dev xvfb gstreamer1.0-tools \
             gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
       - name: Test Linux receiver list with runtime libraries
@@ -55,7 +55,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev desktop-file-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxi-dev desktop-file-utils
 
       - name: Build Linux apps and Debian package
         if: runner.os == 'Linux'
