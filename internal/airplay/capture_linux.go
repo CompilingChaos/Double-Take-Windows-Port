@@ -55,6 +55,9 @@ type ScreenCapture struct {
 	waitErr  error         // set before waitCh is closed
 	frames   videoAccessUnitReader
 	stopOnce sync.Once
+	// Synthetic relays have no process exit status. Their readers own terminal
+	// errors even after waitCh closes; treating that channel as EOF loses them.
+	streamOnly bool
 }
 
 // StartCapture detects the display server (Wayland or X11) and initiates screen
@@ -289,6 +292,9 @@ func startX11Capture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, er
 }
 
 func (sc *ScreenCapture) Read(buf []byte) (int, error) {
+	if sc.streamOnly {
+		return sc.stdout.Read(buf)
+	}
 	select {
 	case <-sc.waitCh:
 		if sc.waitErr != nil {

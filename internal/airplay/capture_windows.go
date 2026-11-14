@@ -48,6 +48,9 @@ type ScreenCapture struct {
 	waitErr  error
 	frames   videoAccessUnitReader
 	stopOnce sync.Once
+	// Synthetic relays have no process exit status. Their readers own terminal
+	// errors even after waitCh closes; treating that channel as EOF loses them.
+	streamOnly bool
 }
 
 // StartCapture starts Windows desktop capture through FFmpeg.
@@ -238,6 +241,9 @@ func ValidateHWAccel(method string) error {
 }
 
 func (sc *ScreenCapture) Read(buf []byte) (int, error) {
+	if sc.streamOnly {
+		return sc.stdout.Read(buf)
+	}
 	select {
 	case <-sc.waitCh:
 		if sc.waitErr != nil {

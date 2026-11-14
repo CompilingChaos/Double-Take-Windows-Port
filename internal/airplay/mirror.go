@@ -676,7 +676,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 
 	dbg("[SETUP] phase 1 (control): preparing media session")
 	controlPlist := setupRequest.controlPlist()
-	if policy.fairPlayOnControl() {
+	if policy.fairPlayOnSessionRoot() {
 		addFairPlayRootFields(controlPlist, c.FpEkey, c.fpIV, true)
 	}
 	controlResp, controlHeaders, receivedAt, err := sendSetup(audioURI, "control", controlPlist)
@@ -789,9 +789,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			return nil, err
 		}
 		if skipRecord {
-			dbg("[SETUP] receiver returned skipRecord=true; session was started by control SETUP")
-		} else if err := recordSession(); err != nil {
-			return nil, err
+			dbg("[SETUP] receiver returned skipRecord=true; RECORD will be skipped after stream setup")
 		}
 	}
 	// Create the audio stream after the control-first probe, or make it the first
@@ -831,7 +829,10 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		} else {
 			request = setupRequest.legacyStreamPlist(stream)
 		}
-		if policy.fairPlayOnStreams() {
+		// When control SETUP was rejected, this audio request creates the media
+		// session and therefore carries the session's FairPlay root material. Once
+		// a session exists, later stream SETUPs contain only their descriptors.
+		if !sessionFirstSetup && policy.fairPlayOnSessionRoot() {
 			if !addFairPlayRootFields(request, c.FpEkey, c.fpIV, true) && audioMode == audioSecurityLegacyAES {
 				dbg("[SETUP] WARNING: no FairPlay ekey/eiv — audio will likely not work")
 			}
@@ -947,17 +948,10 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		videoStreamDesc["shiv"] = encIV
 	}
 
-	var videoSetupPlist map[string]interface{}
-	if sessionFirstSetup {
-		videoSetupPlist = streamOnlyPlist(videoStreamDesc)
-	} else {
-		videoSetupPlist = setupRequest.legacyStreamPlist(videoStreamDesc)
-	}
-	// Legacy FairPlay sessions derive video keys from material at the SETUP root,
-	// independent of whether the plist is stream-only.
-	if policy.fairPlayOnStreams() && encKey != nil {
-		addFairPlayRootFields(videoSetupPlist, c.FpEkey, encIV, false)
-	}
+	// Audio SETUP has established the session in both negotiated orderings. The
+	// video request now attaches one stream and must not repeat session timing or
+	// FairPlay root material.
+	videoSetupPlist := streamOnlyPlist(videoStreamDesc)
 	dbg("[SETUP] phase %d (video): streamConnectionID=%d", videoPhase, videoStreamConnectionID)
 
 	var dataPort int
@@ -1007,14 +1001,14 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	}
 	dbg("[SETUP] data channel connected: %s (TCP_NODELAY, sndbuf=64K)", dataAddr)
 
-	// Legacy receivers prepare the session with their combined audio SETUP and
-	// start it only after both streams exist.
-	if !sessionFirstSetup {
-		if skipRecord {
-			dbg("[SETUP] receiver returned skipRecord=true; session was started by SETUP")
-		} else if err := recordSession(); err != nil {
-			return nil, err
-		}
+	// The sender activates the session in its second start stage, after every
+	// transport stream has been set up. A receiver may waive that final RECORD
+	// request with skipRecord, but accepting the control SETUP alone does not
+	// make it safe to activate an otherwise incomplete session.
+	if skipRecord {
+		dbg("[SETUP] receiver returned skipRecord=true; session was started by SETUP")
+	} else if err := recordSession(); err != nil {
+		return nil, err
 	}
 
 	// Only set the receiver's volume when this session actually carries audio.
