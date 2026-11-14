@@ -12,12 +12,12 @@ import (
 
 func TestSplitStaleSpeakerMuteMarkersKeepsLiveOwners(t *testing.T) {
 	markers := []speakerMuteMarker{
-		{PID: 10, Device: "speakers"},  // this process
-		{PID: 20, Device: "speakers"},  // another running DoubleTake
-		{PID: 30, Device: "speakers"},  // crashed
-		{PID: 31, Device: "speakers"},  // crashed, same endpoint
+		{PID: 10, Device: "speakers"},   // this process
+		{PID: 20, Device: "speakers"},   // another running DoubleTake
+		{PID: 30, Device: "speakers"},   // crashed
+		{PID: 31, Device: "speakers"},   // crashed, same endpoint
 		{PID: 40, Device: "headphones"}, // crashed
-		{PID: 50, Device: ""},          // malformed
+		{PID: 50, Device: ""},           // malformed
 	}
 	running := func(pid int) bool { return pid == 20 }
 	stale, keep := splitStaleSpeakerMuteMarkers(markers, 10, running)
