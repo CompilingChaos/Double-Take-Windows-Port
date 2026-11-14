@@ -85,8 +85,12 @@ type Response struct {
 	NeedsCredential bool           `json:"needs_credential,omitempty"`
 	CredentialKind  CredentialKind `json:"credential_kind,omitempty"`
 	Error           string         `json:"error,omitempty"`
-	Devices         []DeviceInfo   `json:"devices,omitempty"`
-	Streams         []StreamInfo   `json:"streams,omitempty"`
+	// ErrorID identifies the most recent asynchronous failure. It changes each
+	// time one is recorded, so a client can tell a repeat of the same message
+	// from the failure it has already shown. Zero means none was recorded.
+	ErrorID uint64       `json:"error_id,omitempty"`
+	Devices []DeviceInfo `json:"devices,omitempty"`
+	Streams []StreamInfo `json:"streams,omitempty"`
 }
 
 // DeviceInfo is a simplified view of a discovered AirPlay device.
@@ -277,6 +281,12 @@ type Daemon struct {
 	captureStartMu  sync.Mutex                             // serializes exact-size group publication/encoder startup
 	lastError       string                                 // most recent asynchronous stream failure
 	lastErrorTarget string                                 // target associated with lastError; empty for capture-wide errors
+	lastErrorID     uint64                                 // increments with every recorded lastError
+
+	// discover and discoveryCycle replace the network scan and its 5-second
+	// cadence in tests. Nil and zero select the defaults.
+	discover       func(context.Context) ([]airplay.AirPlayDevice, error)
+	discoveryCycle time.Duration
 
 	discoverCancel context.CancelFunc
 	listener       net.Listener
@@ -428,17 +438,27 @@ func (d *Daemon) Shutdown() {
 	}
 }
 
+// defaultDiscoveryCycle is how often background discovery starts a scan.
+const defaultDiscoveryCycle = 5 * time.Second
+
 // backgroundDiscover continuously browses mDNS for AirPlay devices.
-// Each scan runs for 5 seconds. Devices not seen for >30 seconds are removed.
+// A scan starts every discovery cycle (5 seconds). Devices not seen for >30
+// seconds are removed.
 func (d *Daemon) backgroundDiscover(ctx context.Context) {
-	const (
-		scanDuration = 5 * time.Second
-		deviceTTL    = 30 * time.Second
-	)
+	const deviceTTL = 30 * time.Second
+	cycle := d.discoveryCycle
+	if cycle <= 0 {
+		cycle = defaultDiscoveryCycle
+	}
+	discover := d.discover
+	if discover == nil {
+		discover = airplay.DiscoverAirPlayDevices
+	}
 	log.Printf("[daemon] starting continuous mDNS discovery")
 	for {
-		browseCtx, cancel := context.WithTimeout(ctx, scanDuration)
-		found, err := airplay.DiscoverAirPlayDevices(browseCtx)
+		cycleStart := time.Now()
+		browseCtx, cancel := context.WithTimeout(ctx, cycle)
+		found, err := discover(browseCtx)
 		cancel()
 
 		if ctx.Err() != nil {
@@ -484,9 +504,15 @@ func (d *Daemon) backgroundDiscover(ctx context.Context) {
 			log.Printf("[daemon] mDNS browse error: %v", err)
 		}
 
-		// Next scan starts immediately (no extra wait — the 5s scan is the cadence)
-		if ctx.Err() != nil {
+		// Start the next scan only when this cycle is over. A scan can return
+		// early, for example when no network interface is up and the resolver
+		// fails at once; retrying immediately would spin and flood the log.
+		wait := time.NewTimer(time.Until(cycleStart.Add(cycle)))
+		select {
+		case <-ctx.Done():
+			wait.Stop()
 			return
+		case <-wait.C:
 		}
 	}
 }
@@ -569,6 +595,10 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 	if errMsg == "" {
 		errMsg = d.lastError
 	}
+	var errorID uint64
+	if d.lastError != "" {
+		errorID = d.lastErrorID
+	}
 	streams := make([]StreamInfo, 0, len(d.streams))
 	for _, s := range d.streams {
 		streams = append(streams, StreamInfo{
@@ -632,6 +662,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 		NeedsCredential: credentialKind != "",
 		CredentialKind:  credentialKind,
 		Error:           errMsg,
+		ErrorID:         errorID,
 		Streams:         streams,
 	}
 }
@@ -831,6 +862,14 @@ func (d *Daemon) pendingCredentialTargetsLocked() []string {
 // receiver that produced it. Starting another target must not hide a concurrent
 // connection failure before a control client has a chance to report it.
 // Must be called with d.mu held.
+// recordErrorLocked publishes an asynchronous failure through status. Must
+// be called with d.mu held.
+func (d *Daemon) recordErrorLocked(message, target string) {
+	d.lastError = message
+	d.lastErrorTarget = target
+	d.lastErrorID++
+}
+
 func (d *Daemon) clearLastErrorForTargetLocked(target string) {
 	if d.lastErrorTarget == "" || d.lastErrorTarget == target {
 		d.lastError = ""
@@ -891,8 +930,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 			return
 		}
 		if failure != "" {
-			d.lastError = failure
-			d.lastErrorTarget = target
+			d.recordErrorLocked(failure, target)
 		}
 		cleanup := d.detachStreamLocked(target)
 		d.mu.Unlock()
@@ -1358,6 +1396,12 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	d.mu.Lock()
 	cleanup := daemonCleanup{}
 	if d.streams[target] == entry {
+		// Report a stream that died on its own, such as a receiver that was
+		// switched off or dropped off the network. A user disconnect cancels
+		// ctx and is not an error.
+		if streamErr != nil && ctx.Err() == nil {
+			d.recordErrorLocked(fmt.Sprintf("%s: mirroring stopped: %v", target, streamErr), target)
+		}
 		cleanup = d.detachStreamLocked(target)
 	}
 	d.mu.Unlock()
@@ -1622,8 +1666,7 @@ func (d *Daemon) finishCaptureGroup(group *videoCaptureGroup, broadcast *airplay
 	}
 	inUse := d.captureGroupInUseLocked(group)
 	if unexpected && inUse {
-		d.lastError = fmt.Sprintf("%dx%d capture failed: %v", group.key.maxWidth, group.key.maxHeight, runErr)
-		d.lastErrorTarget = ""
+		d.recordErrorLocked(fmt.Sprintf("%dx%d capture failed: %v", group.key.maxWidth, group.key.maxHeight, runErr), "")
 	}
 	// A capture failure affects only receivers consuming this encoded canvas;
 	// other resolution groups continue streaming.
