@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"runtime"
 	"sync/atomic"
@@ -29,6 +30,7 @@ const (
 	audclntStreamflagsLoopback       = 0x00020000
 	audclntStreamflagsAutoconvertPCM = 0x80000000
 	audclntBufferflagsSilent         = 0x00000002
+	audclntBufferflagsTimestampError = 0x00000004
 
 	waveFormatPCM           = 0x0001
 	waveFormatIEEEFloat     = 0x0003
@@ -163,19 +165,22 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 
 func startWindowsAudioCapture(parent context.Context, codec AudioCodec) (*AudioCapture, error) {
 	ctx, cancel := context.WithCancel(parent)
-	pr, pw := io.Pipe()
+	// The capture thread must never wait for the network sender: process
+	// loopback buffers only one ~10 ms engine period. A timestamped queue keeps
+	// the two apart and lets the sender schedule every frame by its capture time,
+	// exactly like the GStreamer RTP/ONVIF path on Linux.
+	queue := newTimestampedPCMQueue(audioCaptureStallBuffer)
 	waitCh := make(chan struct{})
 	ready := make(chan error, 1)
 	var stopped atomic.Bool
 
 	ac := &AudioCapture{
-		pcmPipe: pr,
-		cancel:  cancel,
+		pcmFrames: queue,
+		cancel:    cancel,
 		stopFn: func() {
 			if stopped.CompareAndSwap(false, true) {
 				cancel()
-				_ = pr.Close()
-				_ = pw.Close()
+				queue.close(nil)
 			}
 		},
 		waitCh: waitCh,
@@ -186,17 +191,12 @@ func startWindowsAudioCapture(parent context.Context, codec AudioCodec) (*AudioC
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 		defer close(waitCh)
-		ac.waitErr = runWASAPILoopback(ctx, pw, ready)
-		if ac.waitErr != nil {
-			_ = pw.CloseWithError(ac.waitErr)
-		} else {
-			_ = pw.Close()
-		}
+		ac.waitErr = runWASAPILoopback(ctx, queue, ready)
+		queue.close(ac.waitErr)
 	}()
 
 	if err := <-ready; err != nil {
 		cancel()
-		_ = pr.Close()
 		return nil, err
 	}
 	return ac, nil
@@ -269,7 +269,7 @@ func runWindowsTestTone(ctx context.Context, out *io.PipeWriter) error {
 	}
 }
 
-func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- error) error {
+func runWASAPILoopback(ctx context.Context, queue *timestampedPCMQueue, ready chan<- error) error {
 	comInitialized, err := coInitialize()
 	if err != nil {
 		ready <- err
@@ -293,30 +293,40 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 	}
 	defer release(unsafe.Pointer(device))
 
-	client, captureClient, formatPtr, freeFormat, err := openWindowsLoopbackCapture(device)
+	opened, err := openWindowsLoopbackCapture(device)
 	if err != nil {
 		ready <- err
 		return err
 	}
+	client, captureClient, formatPtr := opened.client, opened.capture, opened.format
 	defer release(unsafe.Pointer(client))
 	defer release(unsafe.Pointer(captureClient))
-	if freeFormat {
+	if opened.freeFormat {
 		defer procCoTaskMemFree.Call(uintptr(formatPtr))
 	}
 	format := (*waveFormatEx)(formatPtr)
-	formatDesc := describeWaveFormat(formatPtr)
-	dbg("[AUDIO] WASAPI mix format: %s", formatDesc)
+	dbg("[AUDIO] WASAPI capture format: %s", describeWaveFormat(formatPtr))
+
+	restorePriority := raiseCaptureThreadPriority()
+	defer restorePriority()
 
 	if err := client.start(); err != nil {
 		ready <- err
 		return err
 	}
-	restoreSpeakers, err := muteLocalSpeakers(device)
-	if err != nil {
-		client.stop()
-		muteErr := fmt.Errorf("mute local speakers: %w", err)
-		ready <- muteErr
-		return muteErr
+	restoreSpeakers := func() {}
+	if opened.processLoopback {
+		restoreSpeakers, err = muteLocalSpeakers(device)
+		if err != nil {
+			client.stop()
+			muteErr := fmt.Errorf("mute local speakers: %w", err)
+			ready <- muteErr
+			return muteErr
+		}
+	} else {
+		// Endpoint loopback taps the stream after the endpoint mute on many
+		// drivers, so muting the speakers here would send pure silence.
+		log.Printf("[AUDIO] Windows process loopback is unavailable; local speakers stay on while streaming audio")
 	}
 	defer func() {
 		client.stop()
@@ -326,7 +336,7 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 	logged := false
 	ready <- nil
 
-	resampler := &audioResampler{inRate: float64(format.SamplesPerSec)}
+	timeline := newWindowsCaptureTimeline(format.SamplesPerSec, queue)
 	for {
 		select {
 		case <-ctx.Done():
@@ -339,69 +349,85 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 			return err
 		}
 		if packetFrames == 0 {
-			time.Sleep(5 * time.Millisecond)
+			timeline.fillIdle(time.Now())
+			time.Sleep(2 * time.Millisecond)
 			continue
 		}
 
-		data, frames, flags, err := captureClient.getBuffer()
+		packet, err := captureClient.getBuffer()
 		if err != nil {
 			return err
 		}
+		now := time.Now()
+		pts, trusted := capturePacketPTS(now, performanceCounter100ns(), packet.qpcPosition,
+			packet.flags&audclntBufferflagsTimestampError != 0)
+		if !trusted {
+			pts = now
+		}
 		if !logged {
-			dbg("[AUDIO] WASAPI loopback started (%d frames first packet)", frames)
+			dbg("[AUDIO] WASAPI loopback started (%d frames first packet, device timestamps=%t)", packet.frames, trusted)
 			logged = true
 		}
 
-		var pcm []byte
-		if flags&audclntBufferflagsSilent != 0 {
-			pcm = resampler.resampleToPCM(make([]stereoSample, int(frames)))
+		var samples []stereoSample
+		if packet.flags&audclntBufferflagsSilent != 0 {
+			samples = make([]stereoSample, int(packet.frames))
 		} else {
-			samples := decodeWASAPIFrames(data, int(frames), formatPtr)
-			pcm = resampler.resampleToPCM(samples)
+			samples = decodeWASAPIFrames(packet.data, int(packet.frames), formatPtr)
 		}
-		releaseErr := captureClient.releaseBuffer(frames)
-		if releaseErr != nil {
-			return releaseErr
+		if err := captureClient.releaseBuffer(packet.frames); err != nil {
+			return err
 		}
-		if len(pcm) > 0 {
-			if _, err := out.Write(pcm); err != nil {
-				return err
-			}
-		}
+		timeline.push(samples, pts, trusted)
 	}
 }
 
-func openWindowsLoopbackCapture(device *iMMDevice) (*iAudioClient, *iAudioCaptureClient, unsafe.Pointer, bool, error) {
+type windowsLoopbackCapture struct {
+	client          *iAudioClient
+	capture         *iAudioCaptureClient
+	format          unsafe.Pointer
+	freeFormat      bool
+	processLoopback bool
+}
+
+func openWindowsLoopbackCapture(device *iMMDevice) (windowsLoopbackCapture, error) {
 	// Process loopback is independent of the physical endpoint's mute tap and
 	// captures all render streams except those from DoubleTake itself.
-	client, err := activateProcessLoopbackClient()
-	if err == nil {
-		// The virtual device does not implement GetMixFormat. Ask Windows to
-		// convert its mix to the same 44.1 kHz stereo PCM sent over AirPlay.
-		pcm := &waveFormatEx{FormatTag: waveFormatPCM, Channels: 2,
-			SamplesPerSec: 44100, AvgBytesPerSec: 176400,
-			BlockAlign: 4, BitsPerSample: 16}
-		formatPtr := unsafe.Pointer(pcm)
+	var err error
+	for _, rate := range processLoopbackRates(device) {
+		var client *iAudioClient
+		client, err = activateProcessLoopbackClient()
+		if err != nil {
+			break
+		}
+		// The virtual device does not implement GetMixFormat. Request the
+		// engine's own rate: the Windows 44.1 kHz conversion of a 48 kHz mix drops
+		// samples, which shows up as a slowly drifting, glitching stream. The
+		// timeline resamples to AirPlay's 44.1 kHz with sample-accurate timing.
+		format := &waveFormatEx{FormatTag: waveFormatIEEEFloat, Channels: 2,
+			SamplesPerSec: rate, AvgBytesPerSec: rate * 8,
+			BlockAlign: 8, BitsPerSample: 32}
+		formatPtr := unsafe.Pointer(format)
 		if err = client.initialize(formatPtr, true); err == nil {
 			var capture *iAudioCaptureClient
 			capture, err = client.getCaptureService()
 			if err == nil {
-				dbg("[AUDIO] using Windows process loopback")
-				return client, capture, formatPtr, false, nil
+				dbg("[AUDIO] using Windows process loopback at %d Hz", rate)
+				return windowsLoopbackCapture{client: client, capture: capture, format: formatPtr, processLoopback: true}, nil
 			}
 		}
 		release(unsafe.Pointer(client))
 	}
 	dbg("[AUDIO] process loopback unavailable (%v); using endpoint loopback", err)
 
-	client, err = device.activateAudioClient()
+	client, err := device.activateAudioClient()
 	if err != nil {
-		return nil, nil, nil, false, err
+		return windowsLoopbackCapture{}, err
 	}
 	formatPtr, err := client.getMixFormat()
 	if err != nil {
 		release(unsafe.Pointer(client))
-		return nil, nil, nil, false, err
+		return windowsLoopbackCapture{}, err
 	}
 	if kind := waveAudioKind(formatPtr); kind != waveFormatPCM && kind != waveFormatIEEEFloat {
 		err = fmt.Errorf("unsupported WASAPI mix format: %s", describeWaveFormat(formatPtr))
@@ -411,15 +437,42 @@ func openWindowsLoopbackCapture(device *iMMDevice) (*iAudioClient, *iAudioCaptur
 	if err != nil {
 		procCoTaskMemFree.Call(uintptr(formatPtr))
 		release(unsafe.Pointer(client))
-		return nil, nil, nil, false, err
+		return windowsLoopbackCapture{}, err
 	}
 	capture, err := client.getCaptureService()
 	if err != nil {
 		procCoTaskMemFree.Call(uintptr(formatPtr))
 		release(unsafe.Pointer(client))
-		return nil, nil, nil, false, err
+		return windowsLoopbackCapture{}, err
 	}
-	return client, capture, formatPtr, true, nil
+	return windowsLoopbackCapture{client: client, capture: capture, format: formatPtr, freeFormat: true}, nil
+}
+
+// processLoopbackRates returns the capture rates to try, the default render
+// endpoint's mix rate first.
+func processLoopbackRates(device *iMMDevice) []uint32 {
+	rates := []uint32{48000, audioSampleRate}
+	client, err := device.activateAudioClient()
+	if err != nil {
+		return rates
+	}
+	defer release(unsafe.Pointer(client))
+	formatPtr, err := client.getMixFormat()
+	if err != nil {
+		return rates
+	}
+	mixRate := (*waveFormatEx)(formatPtr).SamplesPerSec
+	procCoTaskMemFree.Call(uintptr(formatPtr))
+	if mixRate < 8000 || mixRate > 384000 {
+		return rates
+	}
+	ordered := []uint32{mixRate}
+	for _, rate := range rates {
+		if rate != mixRate {
+			ordered = append(ordered, rate)
+		}
+	}
+	return ordered
 }
 
 func coInitialize() (bool, error) {
@@ -546,22 +599,28 @@ func (c *iAudioCaptureClient) nextPacketSize() (uint32, error) {
 	return frames, nil
 }
 
-func (c *iAudioCaptureClient) getBuffer() (unsafe.Pointer, uint32, uint32, error) {
-	var data unsafe.Pointer
-	var frames uint32
-	var flags uint32
+type capturePacket struct {
+	data           unsafe.Pointer
+	frames         uint32
+	flags          uint32
+	devicePosition uint64
+	qpcPosition    uint64 // performance counter of the first frame, 100 ns units
+}
+
+func (c *iAudioCaptureClient) getBuffer() (capturePacket, error) {
+	var packet capturePacket
 	hr, _, _ := syscall.SyscallN(c.lpVtbl.GetBuffer,
 		uintptr(unsafe.Pointer(c)),
-		uintptr(unsafe.Pointer(&data)),
-		uintptr(unsafe.Pointer(&frames)),
-		uintptr(unsafe.Pointer(&flags)),
-		0,
-		0,
+		uintptr(unsafe.Pointer(&packet.data)),
+		uintptr(unsafe.Pointer(&packet.frames)),
+		uintptr(unsafe.Pointer(&packet.flags)),
+		uintptr(unsafe.Pointer(&packet.devicePosition)),
+		uintptr(unsafe.Pointer(&packet.qpcPosition)),
 	)
 	if failed(hr) {
-		return nil, 0, 0, fmt.Errorf("GetBuffer: %s", hresultString(hr))
+		return capturePacket{}, fmt.Errorf("GetBuffer: %s", hresultString(hr))
 	}
-	return data, frames, flags, nil
+	return packet, nil
 }
 
 func (c *iAudioCaptureClient) releaseBuffer(frames uint32) error {
