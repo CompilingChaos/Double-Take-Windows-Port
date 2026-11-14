@@ -102,6 +102,9 @@ func networkAddressIP(addr net.Addr) net.IP {
 }
 
 func networkInterfaceIsWireless(name, classPath string) bool {
+	if platformInterfaceIsWireless(name) {
+		return true
+	}
 	for _, marker := range []string{"wireless", "phy80211"} {
 		if _, err := os.Stat(filepath.Join(classPath, name, marker)); err == nil {
 			return true
