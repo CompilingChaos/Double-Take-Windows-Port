@@ -56,6 +56,7 @@ type rtpL16PCMFrameReader struct {
 	ssrc            uint32
 
 	discontinuities uint64
+	drift           captureClockDrift
 }
 
 func newRTPL16PCMFrameReader(reader io.Reader) audioPCMFrameReader {
@@ -121,6 +122,8 @@ func (r *rtpL16PCMFrameReader) readPacket() error {
 	wallPTS := timeFromNTP(header.onvifTimestamp)
 	now := r.now()
 	packetPTS := now.Add(wallPTS.Sub(now))
+	// Keep device-clock timestamps on the host clock as the two drift apart.
+	packetPTS = packetPTS.Add(r.drift.observe(now, packetPTS))
 	discontinuous := !r.haveTimeline
 	if r.haveTimeline {
 		expectedRTP := r.timelineRTP + uint32(r.receivedSamples)
