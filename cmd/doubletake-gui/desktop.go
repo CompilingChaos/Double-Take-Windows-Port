@@ -51,6 +51,37 @@ type desktop struct {
 	lastError                   string
 	results                     chan commandResult
 	busy                        map[string]bool
+	// frameInterval is the redraw rate the animations drawn in the current
+	// frame need; zero when the frame is static.
+	frameInterval time.Duration
+	// invalidate requests a frame from another goroutine. It may be nil.
+	invalidate func()
+}
+
+const (
+	statePollInterval = 850 * time.Millisecond
+	radarFrameRate    = time.Second / 60
+	spinnerFrameRate  = time.Second / 15
+)
+
+// animate asks for the next frame within interval. Only animations on screen
+// call it, so a static window is redrawn just for input and state polls.
+func (d *desktop) animate(interval time.Duration) {
+	if d.frameInterval == 0 || interval < d.frameInterval {
+		d.frameInterval = interval
+	}
+}
+
+// nextFrame returns when the window must be redrawn without new input: at the
+// next animation step, or else at the next daemon state poll.
+func (d *desktop) nextFrame(now time.Time) time.Time {
+	next := d.nextPoll
+	if d.frameInterval > 0 {
+		if step := now.Add(d.frameInterval); step.Before(next) {
+			next = step
+		}
+	}
+	return next
 }
 
 type streamControls struct {
@@ -112,7 +143,7 @@ func (d *desktop) poll(now time.Time) {
 	}
 	previous := d.state
 	d.state = d.backend.state()
-	d.nextPoll = now.Add(850 * time.Millisecond)
+	d.nextPoll = now.Add(statePollInterval)
 	visibleDevices := make(map[deviceKey]bool, len(d.state.Devices))
 	for _, receiver := range d.state.Devices {
 		visibleDevices[receiverKey(receiver)] = true
@@ -171,6 +202,10 @@ func (d *desktop) command(target, message string, run func() daemon.Response) {
 	d.busy[target] = true
 	go func() {
 		d.results <- commandResult{target: target, message: message, response: run()}
+		// A static window draws no frame on its own until the next poll.
+		if d.invalidate != nil {
+			d.invalidate()
+		}
 	}()
 }
 

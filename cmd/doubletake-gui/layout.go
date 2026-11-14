@@ -23,6 +23,7 @@ import (
 )
 
 func (d *desktop) layout(gtx layout.Context) {
+	d.frameInterval = 0
 	d.update(gtx)
 	size := gtx.Constraints.Max
 	if size.X == 0 || size.Y == 0 {
@@ -197,6 +198,7 @@ func (d *desktop) editor(gtx layout.Context, r image.Rectangle, radius, left int
 
 func (d *desktop) radar(gtx layout.Context, cx, y int) {
 	const outerRadius = 27
+	d.animate(radarFrameRate)
 	center := f32.Pt(float32(dp(gtx, cx)), (float32(y)+27.5)*gtx.Metric.PxPerDp)
 	scale := gtx.Metric.PxPerDp * float32(breathe(gtx))
 	defer op.Affine(f32.Affine2D{}.Scale(f32.Point{}, f32.Pt(scale, scale)).Offset(center)).Push(gtx.Ops).Pop()
@@ -250,7 +252,7 @@ func (d *desktop) welcome(gtx layout.Context, w, h int) {
 	mid := w / 2
 	top := h/2 - 109
 	center := f32.Pt(float32(dp(gtx, mid)), float32(dp(gtx, top+65)))
-	size := float32(dp(gtx, 146)) * float32(breathe(gtx))
+	size := float32(dp(gtx, 146))
 	scale := size / float32(d.glow.Size().X)
 	halo := op.Affine(f32.Affine2D{}.Scale(f32.Point{}, f32.Pt(scale, scale)).
 		Offset(center.Sub(f32.Pt(size/2, size/2)))).Push(gtx.Ops)
@@ -291,6 +293,8 @@ func (d *desktop) statusPill(gtx layout.Context, right, y int, value string, dot
 	box(gtx, r, 18, fill, border)
 	center := f32.Pt(float32(left+dp(gtx, 16)), float32(r.Min.Y+r.Max.Y)/2)
 	if waiting {
+		// Shown only while a receiver is connecting or pairing.
+		d.animate(spinnerFrameRate)
 		spinner(gtx, int(center.X), int(math.Round(float64(center.Y))), dot)
 	} else {
 		pulse(gtx, center, dot)

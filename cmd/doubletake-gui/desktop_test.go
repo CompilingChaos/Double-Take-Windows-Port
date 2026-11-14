@@ -62,3 +62,41 @@ func TestDesktopSelectsTheRenderedReceiver(t *testing.T) {
 		t.Fatalf("selected %+v, want %+v", f.selected, want)
 	}
 }
+
+func TestDesktopRedrawsContinuouslyOnlyForAnimations(t *testing.T) {
+	device := daemon.DeviceInfo{Name: "Test Apple TV", IP: "192.0.2.1", Port: 7000, DeviceID: "00:11:22:33:44:55"}
+	f := &discoveryFixture{}
+	d := newDesktop(f, "en", true)
+	var ops op.Ops
+	now := time.Now()
+	frame := func() time.Duration {
+		now = now.Add(statePollInterval) // each frame also polls the daemon
+		ops.Reset()
+		gtx := layout.Context{
+			Constraints: layout.Exact(image.Pt(1120, 760)),
+			Metric:      unit.Metric{PxPerDp: 1, PxPerSp: 1},
+			Now:         now, Ops: &ops,
+		}
+		d.layout(gtx)
+		return d.nextFrame(now).Sub(now)
+	}
+
+	if got := frame(); got != radarFrameRate {
+		t.Fatalf("searching with the radar visible: next frame in %v, want %v", got, radarFrameRate)
+	}
+
+	f.data = snapshot{Devices: []daemon.DeviceInfo{device}}
+	if got := frame(); got != statePollInterval {
+		t.Fatalf("receivers listed, nothing streaming: next frame in %v, want the %v state poll", got, statePollInterval)
+	}
+
+	f.data.Status.Streams = []daemon.StreamInfo{{Device: device.Name, DeviceIP: device.IP, State: daemon.StateStreaming}}
+	if got := frame(); got != statePollInterval {
+		t.Fatalf("streaming: next frame in %v, want the %v state poll", got, statePollInterval)
+	}
+
+	f.data.Status.Streams[0].State = daemon.StateConnecting
+	if got := frame(); got != spinnerFrameRate {
+		t.Fatalf("connecting: next frame in %v, want spinner rate %v", got, spinnerFrameRate)
+	}
+}
