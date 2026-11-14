@@ -656,7 +656,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			return
 		}
 		timingProbesStarted = true
-		go sendNTPTimingProbes(sessionCtx, timingConn, c.host, receiverTimingPort)
+		go sendNTPTimingProbes(sessionCtx, timingConn, c.sessionPeerHost(), receiverTimingPort)
 	}
 	configurePTPClock := func(response map[string]interface{}, headers map[string]string, receivedAt time.Time) error {
 		if timingProtocol != timingProtocolPTP {
@@ -990,7 +990,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	}
 
 	// Connect to the video data port
-	dataAddr := net.JoinHostPort(c.host, strconv.Itoa(dataPort))
+	dataAddr := net.JoinHostPort(c.sessionPeerHost(), strconv.Itoa(dataPort))
 	dataConn, err = net.DialTimeout("tcp", dataAddr, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("connect data port %s: %w", dataAddr, err)
