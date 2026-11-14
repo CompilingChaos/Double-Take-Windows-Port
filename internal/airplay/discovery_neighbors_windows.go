@@ -6,9 +6,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -40,22 +40,23 @@ func browseUnicastPreferredAirPlayDevices(ctx context.Context, ifaces []net.Inte
 		return nil, nil
 	}
 
-	conn, err := listenReusableMDNS(ctx)
+	// Query from an ephemeral port rather than a shared 5353 socket. Windows
+	// delivers a unicast datagram to only one of the sockets sharing a port, so
+	// another mDNS client (the DNS Client service, a browser) can receive the
+	// replies. A query from a port other than 5353 is a one-shot legacy query
+	// (RFC 6762 section 6.7): responders and gateways answer it by unicast to
+	// exactly this socket.
+	var listenConfig net.ListenConfig
+	listener, err := listenConfig.ListenPacket(ctx, "udp4", "0.0.0.0:0")
 	if err != nil {
-		return nil, fmt.Errorf("listen on mDNS port: %w", err)
+		return nil, fmt.Errorf("open mDNS query socket: %w", err)
 	}
-	defer conn.Close()
+	defer listener.Close()
+	conn, ok := listener.(*net.UDPConn)
+	if !ok {
+		return nil, fmt.Errorf("mDNS query socket is %T, want UDP", listener)
+	}
 	packetConn := ipv4.NewPacketConn(conn)
-
-	var joined int
-	for _, iface := range ifaces {
-		if err := packetConn.JoinGroup(&iface, mdnsIPv4Address); err == nil {
-			joined++
-		}
-	}
-	if joined == 0 {
-		return nil, fmt.Errorf("join mDNS group on selected interfaces")
-	}
 
 	packet, err := unicastPreferredAirPlayQuestion().Pack()
 	if err != nil {
@@ -131,33 +132,10 @@ func sendMDNSQuestion(packetConn *ipv4.PacketConn, packet []byte, ifaces []net.I
 	return nil
 }
 
-func listenReusableMDNS(ctx context.Context) (*net.UDPConn, error) {
-	listenConfig := net.ListenConfig{
-		Control: func(_, _ string, raw syscall.RawConn) error {
-			var optionErr error
-			if err := raw.Control(func(fd uintptr) {
-				optionErr = windows.SetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, windows.SO_REUSEADDR, 1)
-			}); err != nil {
-				return err
-			}
-			return optionErr
-		},
-	}
-	packetConn, err := listenConfig.ListenPacket(ctx, "udp4", "0.0.0.0:5353")
-	if err != nil {
-		return nil, err
-	}
-	conn, ok := packetConn.(*net.UDPConn)
-	if !ok {
-		packetConn.Close()
-		return nil, fmt.Errorf("mDNS listener is %T, want UDP", packetConn)
-	}
-	return conn, nil
-}
-
 func unicastPreferredAirPlayQuestion() *dns.Msg {
 	return &dns.Msg{
-		MsgHdr: dns.MsgHdr{RecursionDesired: false},
+		// Legacy unicast responders echo the query ID.
+		MsgHdr: dns.MsgHdr{Id: dns.Id(), RecursionDesired: false},
 		Question: []dns.Question{{
 			Name:   "_airplay._tcp.local.",
 			Qtype:  dns.TypePTR,
@@ -202,20 +180,42 @@ func airPlayDevicesFromDNSResponse(response *dns.Msg) []AirPlayDevice {
 		if server == nil {
 			continue
 		}
-		hostAddresses := addresses[canonicalDNSName(server.Target)]
-		if len(hostAddresses) == 0 {
+		address := preferredServiceAddress(addresses[canonicalDNSName(server.Target)])
+		if address == "" {
 			continue
 		}
 
 		device := AirPlayDevice{
 			Name: airPlayInstanceName(instance),
-			IP:   hostAddresses[0],
+			IP:   address,
 			Port: int(server.Port),
 		}
 		populateDeviceFromTXT(&device, parseTXT(text[serviceName]))
 		devices = append(devices, device)
 	}
 	return devices
+}
+
+// preferredServiceAddress picks a connectable address from a DNS-SD host's
+// records, independent of record order: IPv4 first, then routable IPv6. An
+// IPv6 link-local address is skipped because a DNS answer carries no
+// interface zone, and without one it cannot be dialed.
+func preferredServiceAddress(addresses []string) string {
+	var ipv6 string
+	for _, address := range addresses {
+		addr, err := netip.ParseAddr(address)
+		if err != nil {
+			continue
+		}
+		addr = addr.Unmap()
+		if addr.Is4() {
+			return addr.String()
+		}
+		if ipv6 == "" && !addr.IsLinkLocalUnicast() {
+			ipv6 = addr.String()
+		}
+	}
+	return ipv6
 }
 
 func canonicalDNSName(name string) string {

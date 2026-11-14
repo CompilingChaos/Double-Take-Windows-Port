@@ -4,6 +4,7 @@ package airplay
 
 import (
 	"encoding/binary"
+	"net"
 	"reflect"
 	"testing"
 	"unsafe"
@@ -71,6 +72,53 @@ func TestAirPlayDevicesFromDNSResponse(t *testing.T) {
 	}
 	if device.Model != "AppleTV5,3" || device.DeviceID != "AA:BB:CC:DD:EE:FF" || device.SourceVersion != "960.13.1" {
 		t.Fatalf("device TXT fields = %+v", device)
+	}
+}
+
+func TestAirPlayDevicesFromDNSResponsePrefersConnectableAddress(t *testing.T) {
+	const (
+		service = "TV._airplay._tcp.local."
+		host    = "tv.local."
+	)
+	records := func(addresses ...dns.RR) *dns.Msg {
+		return &dns.Msg{
+			MsgHdr: dns.MsgHdr{Response: true},
+			Answer: []dns.RR{&dns.PTR{
+				Hdr: dns.RR_Header{Name: "_airplay._tcp.local.", Rrtype: dns.TypePTR, Class: dns.ClassINET},
+				Ptr: service,
+			}},
+			Extra: append([]dns.RR{&dns.SRV{
+				Hdr:    dns.RR_Header{Name: service, Rrtype: dns.TypeSRV, Class: dns.ClassINET},
+				Port:   7000,
+				Target: host,
+			}}, addresses...),
+		}
+	}
+	linkLocal := &dns.AAAA{Hdr: dns.RR_Header{Name: host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET}, AAAA: net.ParseIP("fe80::1")}
+	global := &dns.AAAA{Hdr: dns.RR_Header{Name: host, Rrtype: dns.TypeAAAA, Class: dns.ClassINET}, AAAA: net.ParseIP("2001:db8::7")}
+	v4 := &dns.A{Hdr: dns.RR_Header{Name: host, Rrtype: dns.TypeA, Class: dns.ClassINET}, A: net.IPv4(192, 0, 2, 7)}
+
+	for _, test := range []struct {
+		name     string
+		response *dns.Msg
+		want     string
+	}{
+		{"IPv4 after link-local IPv6", records(linkLocal, global, v4), "192.0.2.7"},
+		{"routable IPv6 without IPv4", records(linkLocal, global), "2001:db8::7"},
+		{"only link-local IPv6", records(linkLocal), ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := airPlayDevicesFromDNSResponse(test.response)
+			if test.want == "" {
+				if len(got) != 0 {
+					t.Fatalf("devices = %+v, want none without a dialable address", got)
+				}
+				return
+			}
+			if len(got) != 1 || got[0].IP != test.want {
+				t.Fatalf("devices = %+v, want one at %s", got, test.want)
+			}
+		})
 	}
 }
 
