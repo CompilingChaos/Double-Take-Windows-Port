@@ -127,7 +127,7 @@ func muteLocalSpeakers(device *iMMDevice) (func(), error) {
 	// A previous DoubleTake process may have died while it held this endpoint
 	// muted. Restore that first, so the state recorded below is the user's own.
 	if enumerator, err := newMMDeviceEnumerator(); err == nil {
-		recoverInterruptedSpeakerMutes(enumerator)
+		recoverInterruptedSpeakerMutes(enumerator.unmuteEndpoint)
 		release(unsafe.Pointer(enumerator))
 	}
 
@@ -205,14 +205,14 @@ func RestoreInterruptedSpeakerMute() {
 		defer release(unsafe.Pointer(enumerator))
 		speakerMutes.Lock()
 		defer speakerMutes.Unlock()
-		recoverInterruptedSpeakerMutes(enumerator)
+		recoverInterruptedSpeakerMutes(enumerator.unmuteEndpoint)
 	}()
 	<-done
 }
 
 // recoverInterruptedSpeakerMutes must be called with speakerMutes held on a
 // COM-initialized thread.
-func recoverInterruptedSpeakerMutes(enumerator *iMMDeviceEnumerator) {
+func recoverInterruptedSpeakerMutes(unmute func(string) error) {
 	markers := readSpeakerMuteMarkers()
 	if len(markers) == 0 {
 		return
@@ -221,9 +221,18 @@ func recoverInterruptedSpeakerMutes(enumerator *iMMDeviceEnumerator) {
 	if len(stale) == 0 {
 		return
 	}
+	active := make(map[string]bool, len(keep))
+	for _, marker := range keep {
+		active[marker.Device] = true
+	}
 	for _, marker := range stale {
-		if err := unmuteEndpoint(enumerator, marker.Device); err != nil {
+		if active[marker.Device] {
+			keep = append(keep, marker)
+			continue
+		}
+		if err := unmute(marker.Device); err != nil {
 			dbg("[AUDIO] restore speakers muted by interrupted session: %v", err)
+			keep = append(keep, marker)
 			continue
 		}
 		log.Printf("[AUDIO] restored speakers left muted by an interrupted DoubleTake session")
@@ -231,8 +240,8 @@ func recoverInterruptedSpeakerMutes(enumerator *iMMDeviceEnumerator) {
 	writeSpeakerMuteMarkers(keep)
 }
 
-func unmuteEndpoint(enumerator *iMMDeviceEnumerator, id string) error {
-	device, err := enumerator.getDevice(id)
+func (e *iMMDeviceEnumerator) unmuteEndpoint(id string) error {
+	device, err := e.getDevice(id)
 	if err != nil {
 		return err
 	}

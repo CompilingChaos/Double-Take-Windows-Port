@@ -53,8 +53,10 @@ func parsePortRange(s string) (int, int, error) {
 }
 
 func main() {
-	defer pauseForStandaloneConsole()
+	exitProgram(run())
+}
 
+func run() int {
 	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 	target := flag.String("target", "", "AirPlay receiver IP address or hostname (skip discovery)")
 	port := flag.Int("port", 7000, "AirPlay port")
@@ -85,9 +87,9 @@ func main() {
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
 	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			return
+			return 0
 		}
-		exitProgram(2)
+		return 2
 	}
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		fatalf("invalid -hwaccel: %v", err)
@@ -114,7 +116,7 @@ func main() {
 
 	if *daemonize {
 		runDaemon(*socketPath, *credFile, *credBackend, *fps, *bitrate, portMin, portMax, *hwaccel, airplay.VideoCodec(*videoCodec), !*noCursor, credential, *debug, *testMode, *noEncrypt, *directKey, *noAudio)
-		return
+		return 0
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -147,7 +149,7 @@ func main() {
 		if err != nil {
 			if errors.Is(err, errSelectionCancelled) {
 				log.Println("selection cancelled")
-				return
+				return 0
 			}
 			fatalf("discovery failed: %v", err)
 		}
@@ -472,12 +474,12 @@ func main() {
 	}
 
 	if err := session.StreamFrames(ctx, capture, 0*time.Second); err != nil && ctx.Err() == nil {
-		// Return instead of exiting so deferred cleanup runs: capture and
-		// audio stop (restoring the local speakers) and the session tears down.
+		// Return the exit code so deferred capture and session cleanup runs.
 		log.Printf("streaming error: %v", err)
-		return
+		return 1
 	}
 	log.Println("stream ended")
+	return 0
 }
 
 func credentialOrPrompt(value string, client *airplay.AirPlayClient, info *airplay.ReceiverInfo, expectPIN bool) string {

@@ -1,16 +1,102 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"doubletake/internal/airplay"
+	"howett.net/plist"
 )
+
+func TestConnectKeepsSelectedReceiverAcrossDiscoveryRefresh(t *testing.T) {
+	const (
+		selectedID    = "00:11:22:33:44:55"
+		replacementID = "00:11:22:33:44:66"
+	)
+	for _, tc := range []struct {
+		name         string
+		requestID    string
+		discoveredID string
+	}{
+		{name: "daemon discovery snapshot", discoveredID: selectedID},
+		{name: "desktop selection survives an already refreshed cache", requestID: selectedID, discoveredID: replacementID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := New(Config{CredFile: filepath.Join(t.TempDir(), "pairings.json")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(d.Shutdown)
+			pub, priv, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.credStore.SavePairing(selectedID, "test", pub, priv, airplay.PairingProtocolHAP,
+				&airplay.ReceiverIdentity{ID: "known receiver", PublicKey: pub}); err != nil {
+				t.Fatal(err)
+			}
+
+			listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			deadline := time.Now().Add(5 * time.Second)
+			listener.SetDeadline(deadline)
+			addr := listener.Addr().(*net.TCPAddr)
+			target := addr.IP.String()
+			d.devices = []airplay.AirPlayDevice{{IP: target, Port: addr.Port, DeviceID: tc.discoveredID}}
+			if resp := d.Execute(Request{Cmd: "connect", Target: target, Port: addr.Port, DeviceID: tc.requestID}); !resp.OK {
+				t.Fatal(resp.Error)
+			}
+			conn, err := listener.AcceptTCP()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.SetDeadline(deadline)
+			reader := bufio.NewReader(conn)
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					t.Fatal(err)
+				}
+				if line == "\r\n" {
+					break
+				}
+			}
+			d.mu.Lock()
+			d.devices = []airplay.AirPlayDevice{{IP: target, Port: addr.Port, DeviceID: replacementID}}
+			d.mu.Unlock()
+
+			info, err := plist.Marshal(map[string]string{"deviceID": replacementID}, plist.BinaryFormat)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fmt.Fprintf(conn, "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: %d\r\n\r\n%s", len(info), info); err != nil {
+				t.Fatal(err)
+			}
+			for time.Now().Before(deadline) {
+				if resp := d.Execute(Request{Cmd: "status"}); resp.Error != "" {
+					if !strings.Contains(resp.Error, "refusing to cast") {
+						t.Fatalf("expected a receiver identity refusal, got %q", resp.Error)
+					}
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			t.Fatal("daemon did not refuse the replacement receiver")
+		})
+	}
+}
 
 func TestRequiredPairingCredentialKind(t *testing.T) {
 	const (

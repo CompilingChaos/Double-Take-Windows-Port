@@ -65,8 +65,8 @@ func (b *backend) state() snapshot {
 	return snapshot{Status: status, Devices: devices.Devices, FreezeArmedTarget: target, FreezeArmedAction: frozen, SystemMessage: b.systemMessage()}
 }
 
-func (b *backend) connect(target string, port int) daemon.Response {
-	return b.daemon.Execute(daemon.Request{Cmd: "connect", Target: target, Port: port, StartMuted: true})
+func (b *backend) connect(target string, port int, deviceID string) daemon.Response {
+	return b.daemon.Execute(daemon.Request{Cmd: "connect", Target: target, Port: port, DeviceID: deviceID, StartMuted: true})
 }
 
 func (b *backend) submitCredential(target, credential string) daemon.Response {

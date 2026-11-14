@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+func TestFFmpegBufferAllowsLargerSoftwareH264Keyframes(t *testing.T) {
+	for encoder, want := range map[string]int{"libx264": 1244, "h264_nvenc": 276, "libx265": 276, "hevc_nvenc": 276} {
+		if got := ffmpegBufferKbit(4147, 30, encoder); got != want {
+			t.Errorf("%s buffer = %d kbit, want %d kbit", encoder, got, want)
+		}
+	}
+}
+
 func TestFFmpegHEVCTestCaptureProducesSampleDescription(t *testing.T) {
 	if _, err := ffmpegExecutable(); err != nil {
 		t.Skipf("FFmpeg unavailable: %v", err)

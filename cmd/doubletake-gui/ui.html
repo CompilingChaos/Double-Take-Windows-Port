@@ -323,6 +323,8 @@
         query,
         devices: (appState.devices || []).map(d => ({
           ip: d.ip,
+          port: d.port,
+          device_id: d.device_id,
           name: d.name || 'Apple TV',
           model: d.model || tr('receiver')
         })),
@@ -342,13 +344,15 @@
       }
       $('deviceList').innerHTML = devices.map(d => {
         const active = streamFor(d.ip);
-        return `<button class="device ${active ? 'active' : ''}" data-ip="${esc(d.ip)}" ${active ? 'disabled' : ''}>
+        return `<button class="device ${active ? 'active' : ''}" ${active ? 'disabled' : ''}>
           <span class="tv-icon">${icons.tv}</span>
           <span><div class="device-name">${esc(d.name || 'Apple TV')}</div><div class="device-meta">${esc(d.model || tr('receiver'))} · ${esc(d.ip)}</div></span>
           ${active ? '<span class="connected-dot"></span>' : '<svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg>'}
         </button>`;
       }).join('');
-      document.querySelectorAll('.device:not(:disabled)').forEach(el => el.addEventListener('click', () => chooseDevice(el.dataset.ip)));
+      $('deviceList').querySelectorAll('.device').forEach((el, index) => {
+        el.addEventListener('click', () => chooseDevice(devices[index]));
+      });
     }
 
     function stateLabel(stream) {
@@ -464,11 +468,9 @@
       } finally { polling = false; }
     }
 
-    async function chooseDevice(ip) {
-      const device = (appState.devices || []).find(d => d.ip === ip);
-      if (!device) return;
+    async function chooseDevice(device) {
       try {
-        const response = await connectDevice(device.ip, device.port);
+        const response = await connectDevice(device.ip, device.port, device.device_id || '');
         if (!response.ok) toast(response.error || tr('couldNotConnect'), true);
         else toast(tr('connectingTo', device.name || 'Apple TV'));
       } catch (err) { toast(String(err), true); }

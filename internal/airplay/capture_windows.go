@@ -82,16 +82,16 @@ func startFFmpegCapture(ctx context.Context, cfg CaptureConfig, ffmpegPath strin
 	if scale := ffmpegReceiverScaleFilter(cfg); scale != "" {
 		ffArgs = append(ffArgs, "-vf", scale)
 	}
-	encoderArgs, pixelFormat, muxer, err := ffmpegVideoEncoder(cfg, ffmpegPath)
+	encoder, encoderArgs, pixelFormat, muxer, err := ffmpegVideoEncoder(cfg, ffmpegPath)
 	if err != nil {
 		return nil, err
 	}
-	ffArgs = append(ffArgs, encoderArgs...)
+	ffArgs = append(append(ffArgs, "-c:v", encoder), encoderArgs...)
 	ffArgs = append(ffArgs,
 		"-pix_fmt", pixelFormat,
 		"-b:v", fmt.Sprintf("%dk", bitrate),
 		"-maxrate", fmt.Sprintf("%dk", bitrate+bitrate/4),
-		"-bufsize", fmt.Sprintf("%dk", vbvBufferKbit(bitrate, fps)),
+		"-bufsize", fmt.Sprintf("%dk", ffmpegBufferKbit(bitrate, fps, encoder)),
 		"-g", fmt.Sprintf("%d", keyframeInterval),
 		"-bf", "0",
 		"-fflags", "nobuffer",
@@ -114,16 +114,16 @@ func ffmpegBoolean(value bool) string {
 	return "0"
 }
 
-func ffmpegVideoEncoder(cfg CaptureConfig, ffmpegPath string) (args []string, pixelFormat, muxer string, err error) {
+func ffmpegVideoEncoder(cfg CaptureConfig, ffmpegPath string) (encoder string, args []string, pixelFormat, muxer string, err error) {
 	if normalizeVideoCodec(cfg.VideoCodec) != VideoCodecHEVC {
-		return ffmpegEncoder(cfg), "yuv420p", "h264", nil
+		encoder, args := ffmpegEncoder(cfg)
+		return encoder, args, "yuv420p", "h264", nil
 	}
 
 	hwaccel := strings.ToLower(cfg.HWAccel)
 	if hwaccel != "none" && ffmpegHEVCHardwareAvailable(ffmpegPath) {
 		log.Printf("[CAPTURE] using FFmpeg NVENC HEVC Main hardware encoding (hevc_nvenc)")
-		return []string{
-			"-c:v", "hevc_nvenc",
+		return "hevc_nvenc", []string{
 			"-preset", "p4",
 			"-tune", "ull",
 			"-rc", "cbr",
@@ -136,11 +136,10 @@ func ffmpegVideoEncoder(cfg CaptureConfig, ffmpegPath string) (args []string, pi
 		}, "yuv420p", "hevc", nil
 	}
 	if hwaccel == "nvenc" {
-		return nil, "", "", fmt.Errorf("the requested FFmpeg hevc_nvenc encoder is unavailable or failed its hardware probe")
+		return "", nil, "", "", fmt.Errorf("the requested FFmpeg hevc_nvenc encoder is unavailable or failed its hardware probe")
 	}
 	log.Printf("[CAPTURE] using FFmpeg software HEVC Main encoding (libx265)")
-	return []string{
-		"-c:v", "libx265",
+	return "libx265", []string{
 		"-preset", "ultrafast",
 		"-tune", "zerolatency",
 		"-profile:v", "main",
@@ -148,12 +147,11 @@ func ffmpegVideoEncoder(cfg CaptureConfig, ffmpegPath string) (args []string, pi
 	}, "yuv420p", "hevc", nil
 }
 
-func ffmpegEncoder(cfg CaptureConfig) []string {
+func ffmpegEncoder(cfg CaptureConfig) (string, []string) {
 	hwaccel := strings.ToLower(cfg.HWAccel)
 	if hwaccel == "nvenc" {
 		log.Printf("[CAPTURE] using FFmpeg NVENC hardware encoding (h264_nvenc)")
-		return []string{
-			"-c:v", "h264_nvenc",
+		return "h264_nvenc", []string{
 			"-preset", "p4",
 			"-tune", "ull",
 			"-rc", "cbr",
@@ -164,8 +162,7 @@ func ffmpegEncoder(cfg CaptureConfig) []string {
 		dbg("[CAPTURE] FFmpeg auto mode uses libx264; pass -hwaccel nvenc to force NVIDIA encoding")
 	}
 	log.Printf("[CAPTURE] using FFmpeg software encoding (libx264)")
-	return []string{
-		"-c:v", "libx264",
+	return "libx264", []string{
 		"-preset", "ultrafast",
 		"-tune", "zerolatency",
 		"-x264-params", "repeat-headers=1:scenecut=0",
@@ -324,16 +321,16 @@ func StartTestCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, e
 	if scale := ffmpegReceiverScaleFilter(cfg); scale != "" {
 		ffArgs = append(ffArgs, "-vf", scale)
 	}
-	encoderArgs, pixelFormat, muxer, err := ffmpegVideoEncoder(cfg, ffmpegPath)
+	encoder, encoderArgs, pixelFormat, muxer, err := ffmpegVideoEncoder(cfg, ffmpegPath)
 	if err != nil {
 		return nil, err
 	}
-	ffArgs = append(ffArgs, encoderArgs...)
+	ffArgs = append(append(ffArgs, "-c:v", encoder), encoderArgs...)
 	ffArgs = append(ffArgs,
 		"-pix_fmt", pixelFormat,
 		"-b:v", fmt.Sprintf("%dk", bitrate),
 		"-maxrate", fmt.Sprintf("%dk", bitrate+bitrate/4),
-		"-bufsize", fmt.Sprintf("%dk", vbvBufferKbit(bitrate, fps)),
+		"-bufsize", fmt.Sprintf("%dk", ffmpegBufferKbit(bitrate, fps, encoder)),
 		"-g", fmt.Sprintf("%d", keyframeInterval),
 		"-bf", "0",
 		"-f", muxer,
@@ -432,6 +429,16 @@ func keyframeIntervalFrames(fps int) int {
 		fps = 30
 	}
 	return fps * 4
+}
+
+func ffmpegBufferKbit(bitrateKbps, fps int, encoder string) int {
+	buffer := vbvBufferKbit(bitrateKbps, fps)
+	if encoder == "libx264" {
+		// Full desktop keyframes need more than two frames' worth of data.
+		// Allow 300 ms of the target bitrate for encoder bursts.
+		return max(buffer, bitrateKbps*3/10)
+	}
+	return buffer
 }
 
 func vbvBufferKbit(bitrateKbps, fps int) int {

@@ -749,14 +749,25 @@ func (d *Daemon) handleConnect(req Request) Response {
 		}
 	}
 
-	// Look up the discovered port for this target if not explicitly provided.
-	if port == 0 {
-		for _, dev := range d.devices {
-			if dev.IP == target {
-				port = dev.Port
-				break
-			}
+	// Keep the discovery snapshot used to select this target through every
+	// handshake and retry. A later browse may associate the address with a
+	// different receiver.
+	expectedDeviceID := req.DeviceID
+	var advertisement *airplay.AirPlayDevice
+	for _, dev := range d.devices {
+		if dev.IP != target {
+			continue
 		}
+		if port == 0 {
+			port = dev.Port
+		}
+		if expectedDeviceID == "" {
+			expectedDeviceID = dev.DeviceID
+		}
+		if strings.EqualFold(expectedDeviceID, dev.DeviceID) {
+			advertisement = &dev
+		}
+		break
 	}
 	if port == 0 {
 		port = 7000
@@ -787,7 +798,7 @@ func (d *Daemon) handleConnect(req Request) Response {
 
 	go func() {
 		defer d.streamWorkers.Done()
-		d.connectAndStream(connCtx, entry, target, port, req.Pin, req.DeviceID)
+		d.connectAndStream(connCtx, entry, target, port, req.Pin, expectedDeviceID, advertisement)
 	}()
 
 	d.mu.Lock()
@@ -855,7 +866,7 @@ func isAppleTVDevice(device airplay.AirPlayDevice) bool {
 	return strings.HasPrefix(device.Model, "AppleTV")
 }
 
-func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, target string, port int, suppliedCredential, expectedDeviceID string) {
+func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, target string, port int, suppliedCredential, expectedDeviceID string, advertisement *airplay.AirPlayDevice) {
 	// removeStream cleans up this stream's entry and tears down its capture group
 	// if no other streams use that group.
 	removeStream := func(msg string) {
@@ -892,16 +903,11 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 	connectClient := func() (*airplay.AirPlayClient, *airplay.ReceiverInfo, error) {
 		var next *airplay.AirPlayClient
-		d.mu.Lock()
-		for _, device := range d.devices {
-			if device.IP == target {
-				device.Port = port
-				next = airplay.NewAirPlayClientForDevice(device)
-				break
-			}
-		}
-		d.mu.Unlock()
-		if next == nil {
+		if advertisement != nil {
+			device := *advertisement
+			device.Port = port
+			next = airplay.NewAirPlayClientForDevice(device)
+		} else {
 			next = airplay.NewAirPlayClient(target, port)
 		}
 		next.SetPassword(credential)
@@ -943,17 +949,6 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	}
 
 	deviceID := info.DeviceID
-	if expectedDeviceID == "" {
-		// What discovery advertised for this address, before this connection.
-		d.mu.Lock()
-		for _, device := range d.devices {
-			if device.IP == target {
-				expectedDeviceID = device.DeviceID
-				break
-			}
-		}
-		d.mu.Unlock()
-	}
 	if expectedDeviceID == "" {
 		log.Printf("[daemon] warning: no device_id for %s and none discovered; a device there naming itself as a new receiver would be paired with from scratch", target)
 	}

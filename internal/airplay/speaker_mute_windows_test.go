@@ -3,12 +3,42 @@
 package airplay
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"testing"
 )
+
+func TestRecoverInterruptedSpeakerMutesRetriesUnavailableEndpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "speaker-mute.json")
+	previous := speakerMuteMarkerPath
+	speakerMuteMarkerPath = func() string { return path }
+	t.Cleanup(func() { speakerMuteMarkerPath = previous })
+	stale := speakerMuteMarker{PID: 0, Device: "speakers"}
+	active := speakerMuteMarker{PID: os.Getpid(), Device: "speakers"}
+	writeSpeakerMuteMarkers([]speakerMuteMarker{stale, active})
+
+	recoverInterruptedSpeakerMutes(func(device string) error {
+		t.Fatalf("tried to unmute a device still in use: %s", device)
+		return nil
+	})
+	clearSpeakerMute("speakers")
+	recoverInterruptedSpeakerMutes(func(string) error { return errors.New("endpoint offline") })
+	if got := readSpeakerMuteMarkers(); !reflect.DeepEqual(got, []speakerMuteMarker{stale}) {
+		t.Fatalf("markers after failed recovery = %+v, want %+v", got, stale)
+	}
+
+	var restored string
+	recoverInterruptedSpeakerMutes(func(device string) error {
+		restored = device
+		return nil
+	})
+	if got := readSpeakerMuteMarkers(); restored != stale.Device || len(got) != 0 {
+		t.Fatalf("restored = %q, remaining markers = %+v", restored, got)
+	}
+}
 
 func TestSplitStaleSpeakerMuteMarkersKeepsLiveOwners(t *testing.T) {
 	markers := []speakerMuteMarker{
