@@ -405,6 +405,13 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	clientDeviceID := uuidToMAC(c.sessionID)
 	senderName := pairingClientName()
 	policy, err := compatibilityForReceiver(c.info, c.encrypted, !cfg.NoAudio)
+	if err != nil && !cfg.NoAudio && errors.Is(err, ErrAACELDUnavailable) {
+		// An AAC-ELD-only receiver (AirServer, Airtame, ...) can still show the
+		// screen. Mirror video without audio rather than refusing the session.
+		log.Printf("warning: %v; mirroring video without audio", err)
+		cfg.NoAudio = true
+		policy, err = compatibilityForReceiver(c.info, c.encrypted, false)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("negotiate screen audio: %w", err)
 	}
@@ -491,15 +498,21 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		go ntpTimingResponder(sessionCtx, timingConn)
 	}
 
-	// The transport currently exposes no semantic connection-latency hint, so
-	// use Apple's ordinary connection policy. Timing protocol only changes the
-	// clock conversion; it does not select a different playout lead.
-	latencies := screenLatenciesForHint(connectionLatencyNormal)
+	// Select the same low/normal/high screen profiles from the control route's
+	// interface latency hint. Timing protocol only changes clock conversion.
+	latencyHint, routeInterface := connectionLatencyHintForConnection(c.conn)
+	latencies := screenLatenciesForHint(latencyHint)
 	if timingProtocol == timingProtocolNTP && latencies.video < ntpPlayoutLatencyFloor {
 		latencies = latencies.withMinimumVideoLead(ntpPlayoutLatencyFloor)
 		dbg("[SETUP] preserving legacy NTP scheduling floor: video=%v audio=%v", latencies.video, latencies.audio)
 	}
-	dbg("[SETUP] base screen latency policy: video=%v audio=%v", latencies.video, latencies.audio)
+	if routeInterface == "" {
+		dbg("[SETUP] base screen latency policy: hint=%s interface=unknown video=%v audio=%v",
+			connectionLatencyHintName(latencyHint), latencies.video, latencies.audio)
+	} else {
+		dbg("[SETUP] base screen latency policy: hint=%s interface=%s video=%v audio=%v",
+			connectionLatencyHintName(latencyHint), routeInterface, latencies.video, latencies.audio)
+	}
 
 	// Apple's sender prepares the receiver with a control-only SETUP before it
 	// creates media streams. Older protocol implementations can explicitly
@@ -797,8 +810,8 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		"latencyMin":         latMin,
 		"latencyMax":         latMax,
 	}
-	if useAudioFEC(selectedAudioCodec, audioMode == audioSecurityChaCha) {
-		audioStreamBase["redundantAudio"] = int64(2)
+	if useAudioRedundancy(selectedAudioCodec) {
+		audioStreamBase["redundantAudio"] = int64(audioRedundancyCount)
 	}
 
 	// Audio encryption and descriptor shape are separate protocol axes. The
@@ -1090,7 +1103,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	// Set up audio stream if the receiver provided audio ports
 	if audioDataPort > 0 {
 		audioCT := byte(selectedAudioCodec) // ALAC=2 (matches SETUP descriptor)
-		as, err := session.setupAudioStream(audioDataPort, audioControlPort, audioKey, audioIV, audioChaChaKey, audioMode, audioCT, audioLatencySamples, audioCtrlConn, audioDataConn)
+		as, err := session.setupAudioStream(audioDataPort, audioControlPort, audioKey, audioIV, audioChaChaKey, audioMode, audioCT, audioLatencySamples, policy.audioRFC2198, audioCtrlConn, audioDataConn)
 		if err != nil {
 			audioCtrlConn.Close()
 			audioDataConn.Close()
@@ -2310,6 +2323,15 @@ func plistStreamPorts(stream map[string]interface{}) (dataPort, controlPort int)
 // HasAudio returns true if the session has an active audio stream.
 func (s *MirrorSession) HasAudio() bool {
 	return s.audioStream != nil
+}
+
+// AudioEnabled reports whether this session sends audio. A session started
+// without audio -- by request, or because the receiver accepts only a codec
+// this build cannot encode -- still negotiates AirPlay's screen-audio stream,
+// but nothing may be captured or sent on it, and its receiver volume is not
+// ours to control.
+func (s *MirrorSession) AudioEnabled() bool {
+	return s != nil && s.HasAudio() && !s.noAudio
 }
 
 // SetAudioMuted updates mirrored audio volume on the receiver.

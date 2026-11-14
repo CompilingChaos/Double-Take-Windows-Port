@@ -157,10 +157,21 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 	if codec != AudioCodecALAC {
 		return nil, fmt.Errorf("%w: Windows build currently supports ALAC capture only", ErrAACELDUnavailable)
 	}
+	var ac *AudioCapture
+	var err error
 	if testTone {
-		return startWindowsTestToneCapture(ctx, codec)
+		ac, err = startWindowsTestToneCapture(ctx, codec)
+	} else {
+		ac, err = startWindowsAudioCapture(ctx, codec)
 	}
-	return startWindowsAudioCapture(ctx, codec)
+	if err != nil {
+		return nil, err
+	}
+	// Set before the capture is returned, so the frame reader sees it from its
+	// first frame.
+	ac.alac = &alacEncoder{}
+	dbg("[AUDIO] using compressed ALAC")
+	return ac, nil
 }
 
 func startWindowsAudioCapture(parent context.Context, codec AudioCodec) (*AudioCapture, error) {
@@ -232,7 +243,7 @@ func startWindowsTestToneCapture(parent context.Context, codec AudioCodec) (*Aud
 		}
 	}()
 
-	dbg("[AUDIO] using native Windows test tone (440 Hz sine wave)")
+	dbg("[AUDIO] using native Windows test tone (440 Hz sine wave, amplitude %g)", audioTestToneAmplitude)
 	return ac, nil
 }
 
@@ -256,7 +267,7 @@ func runWindowsTestTone(ctx context.Context, out *io.PipeWriter) error {
 
 		pcm := make([]byte, 0, chunk*4)
 		for i := 0; i < chunk; i++ {
-			v := math.Sin(phase) * 0.25
+			v := math.Sin(phase) * audioTestToneAmplitude
 			appendS16Stereo(&pcm, v, v)
 			phase += step
 			if phase >= 2*math.Pi {

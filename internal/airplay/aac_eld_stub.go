@@ -1,8 +1,10 @@
-//go:build !cgo || !fdk_aac
+//go:build !cgo || !fdk_aac || windows
 
 package airplay
 
 import "fmt"
+
+const aacELDEncoderAvailable = false
 
 // eldEncoder is present in every build so codec negotiation remains portable.
 // The actual encoder is deliberately opt-in: libfdk-aac is not available on

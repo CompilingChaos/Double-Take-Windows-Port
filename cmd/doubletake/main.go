@@ -67,7 +67,7 @@ func main() {
 	expectedDeviceID := flag.String("device-id", "", "Device ID of the receiver meant, e.g. from discovery. Its saved pairing applies even if the device at -target names itself differently, and such a device is refused")
 	fps := flag.Int("fps", 30, "Frames per second")
 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
-	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic AirPlay policy)")
+	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic connection profile)")
 	hwaccelHelp := "Hardware acceleration: auto, nvenc, vaapi, openh264, none"
 	if runtime.GOOS == "windows" {
 		hwaccelHelp = "Hardware acceleration: auto, nvenc, none"
@@ -455,7 +455,7 @@ func main() {
 	log.Println("screen capture started")
 
 	// Start audio capture and streaming unless disabled.
-	if !*noAudio && session.HasAudio() {
+	if !*noAudio && session.AudioEnabled() {
 		audioCapture, err := airplay.StartAudioCapture(ctx, *testMode, session.AudioCodec())
 		if err != nil {
 			log.Printf("warning: audio capture failed: %v (continuing without audio)", err)

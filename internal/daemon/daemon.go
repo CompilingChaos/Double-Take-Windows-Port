@@ -574,7 +574,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 			Device:         s.device,
 			DeviceIP:       s.deviceIP,
 			State:          s.state,
-			HasAudio:       !s.noAudio && s.session != nil && s.session.HasAudio(),
+			HasAudio:       !s.noAudio && s.session != nil && s.session.AudioEnabled(),
 			AudioMuted:     s.audioMuted,
 			AudioVolume:    s.audioVolume,
 			Frozen:         s.frozen,
@@ -1269,7 +1269,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 		removeStream("mirror setup completed without preparing video capture")
 		return
 	}
-	if entry.startMuted && session.HasAudio() {
+	if entry.startMuted && session.AudioEnabled() {
 		if err := session.SetAudioVolume(entry.audioVolume, true); err != nil {
 			_ = session.Close()
 			removeStream(fmt.Sprintf("mute receiver audio during setup: %v", err))
@@ -1280,7 +1280,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	// published. A failure must not leave a nominal audio session playing from
 	// the Windows speakers while the receiver's audio control appears usable.
 	var audioCapture *airplay.AudioCapture
-	if entry.startMuted && !entry.noAudio && session.HasAudio() {
+	if entry.startMuted && !entry.noAudio && session.AudioEnabled() {
 		audioCapture, err = airplay.StartAudioCapture(ctx, d.cfg.TestMode, session.AudioCodec())
 		if err != nil {
 			_ = session.Close()
@@ -1311,7 +1311,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	current.session = session
 	current.client = client
 	current.sink = sink
-	current.audioMuted = entry.startMuted && session.HasAudio()
+	current.audioMuted = entry.startMuted && session.AudioEnabled()
 	d.mu.Unlock()
 
 	log.Printf("[daemon] streaming to %s (%s) at %dx%d using %s",
@@ -1324,7 +1324,7 @@ func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, targ
 	// Start audio for this stream independently, but retain a completion channel
 	// so the stream worker does not outlive daemon shutdown.
 	var audioDone chan error
-	if !entry.noAudio && session.HasAudio() {
+	if !entry.noAudio && session.AudioEnabled() {
 		var audioErr error
 		if audioCapture == nil {
 			audioCapture, audioErr = airplay.StartAudioCapture(ctx, d.cfg.TestMode, session.AudioCodec())
@@ -1708,7 +1708,7 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 	}
 	sessions := make([]audioControl, 0, len(targets))
 	for _, t := range targets {
-		if !t.noAudio && t.session != nil && t.session.HasAudio() {
+		if !t.noAudio && t.session != nil && t.session.AudioEnabled() {
 			volume := t.audioVolume
 			if !muted && volume == 0 {
 				volume = 50
@@ -1737,7 +1737,7 @@ func (d *Daemon) handleSetMute(req Request, muted bool) Response {
 
 	d.mu.Lock()
 	for _, t := range targets {
-		if !t.noAudio && t.session != nil && t.session.HasAudio() && !muted && t.audioVolume == 0 {
+		if !t.noAudio && t.session != nil && t.session.AudioEnabled() && !muted && t.audioVolume == 0 {
 			t.audioVolume = 50
 		}
 		t.audioMuted = muted
@@ -1758,7 +1758,7 @@ func (d *Daemon) handleSetVolume(req Request) Response {
 
 	d.mu.Lock()
 	entry, ok := d.streams[req.Target]
-	if !ok || entry.state != StateStreaming || entry.noAudio || entry.session == nil || !entry.session.HasAudio() {
+	if !ok || entry.state != StateStreaming || entry.noAudio || entry.session == nil || !entry.session.AudioEnabled() {
 		resp := d.statusResponseLocked(false, "audio is not streaming to "+req.Target)
 		d.mu.Unlock()
 		return resp

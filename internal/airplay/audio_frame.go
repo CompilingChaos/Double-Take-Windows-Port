@@ -57,6 +57,14 @@ type rtpL16PCMFrameReader struct {
 
 	discontinuities uint64
 	drift           captureClockDrift
+
+	reportPackets      uint64
+	reportSamples      uint64
+	reportInitialized  bool
+	reportMinPTSDelta  int64
+	reportMaxPTSDelta  int64
+	reportMinSourceAge time.Duration
+	reportMaxSourceAge time.Duration
 }
 
 func newRTPL16PCMFrameReader(reader io.Reader) audioPCMFrameReader {
@@ -125,10 +133,11 @@ func (r *rtpL16PCMFrameReader) readPacket() error {
 	// Keep device-clock timestamps on the host clock as the two drift apart.
 	packetPTS = packetPTS.Add(r.drift.observe(now, packetPTS))
 	discontinuous := !r.haveTimeline
+	ptsDeltaSamples := int64(0)
 	if r.haveTimeline {
 		expectedRTP := r.timelineRTP + uint32(r.receivedSamples)
 		expectedPTS := r.timelinePTS.Add(audioSamplesDuration(r.receivedSamples))
-		ptsDeltaSamples := durationToAudioSamples(packetPTS.Sub(expectedPTS))
+		ptsDeltaSamples = durationToAudioSamples(packetPTS.Sub(expectedPTS))
 		discontinuous = !r.havePacket || header.sequence != r.sequence+1 || header.ssrc != r.ssrc ||
 			header.timestamp != expectedRTP
 		if discontinuous {
@@ -162,7 +171,38 @@ func (r *rtpL16PCMFrameReader) readPacket() error {
 	r.havePacket = true
 	r.sequence = header.sequence
 	r.ssrc = header.ssrc
+	r.recordTiming(packetSamples, ptsDeltaSamples, now.Sub(packetPTS))
 	return nil
+}
+
+func (r *rtpL16PCMFrameReader) recordTiming(packetSamples uint64, ptsDeltaSamples int64, sourceAge time.Duration) {
+	if !r.reportInitialized {
+		r.reportInitialized = true
+		r.reportMinPTSDelta = ptsDeltaSamples
+		r.reportMaxPTSDelta = ptsDeltaSamples
+		r.reportMinSourceAge = sourceAge
+		r.reportMaxSourceAge = sourceAge
+	} else {
+		if ptsDeltaSamples < r.reportMinPTSDelta {
+			r.reportMinPTSDelta = ptsDeltaSamples
+		}
+		r.reportMaxPTSDelta = max(r.reportMaxPTSDelta, ptsDeltaSamples)
+		if sourceAge < r.reportMinSourceAge {
+			r.reportMinSourceAge = sourceAge
+		}
+		r.reportMaxSourceAge = max(r.reportMaxSourceAge, sourceAge)
+	}
+	r.reportPackets++
+	r.reportSamples += packetSamples
+	if r.reportSamples < audioSampleRate {
+		return
+	}
+	dbg("[AUDIO-CAPTURE] timing packets=%d samples=%d source-age=%v..%v pts-correction=%d..%d samples buffered=%d discontinuities=%d",
+		r.reportPackets, r.reportSamples, r.reportMinSourceAge, r.reportMaxSourceAge,
+		r.reportMinPTSDelta, r.reportMaxPTSDelta, len(r.pcm)/audioBytesPerSampleFrame, r.discontinuities)
+	r.reportPackets = 0
+	r.reportSamples = 0
+	r.reportInitialized = false
 }
 
 func (r *rtpL16PCMFrameReader) readRFC4571Packet() ([]byte, error) {
@@ -364,8 +404,9 @@ func (c *audioRTPClock) rtpAt(localTime time.Time) (uint32, bool) {
 	if !c.valid || localTime.IsZero() {
 		return 0, false
 	}
-	// Interpolate from the most recent sample-to-time mapping so the
-	// announce follows the captured audio clock as it drifts from host time.
+	// Refresh the interpolation anchor with every captured frame. This follows
+	// the source sample clock over long runs while still producing a continuous
+	// current RTP value between callbacks for TimeAnnounce.
 	deltaSamples := durationToAudioSamples(localTime.Sub(c.lastFramePTS))
 	return c.lastFrameRTP + uint32(deltaSamples), true
 }

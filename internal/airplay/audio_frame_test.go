@@ -43,6 +43,65 @@ func TestAudioCapturePipelineUsesTimestampedFramingWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestPulseMonitorSourceSeparatesStallBufferFromFragment(t *testing.T) {
+	args := strings.Join(pulseMonitorSourceArgs("test.monitor", AudioCodecALAC), " ")
+	for _, want := range []string{
+		"pulsesrc",
+		"device=test.monitor",
+		"buffer-time=50000",
+		"latency-time=7982",
+	} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("Pulse monitor source %q does not contain %q", args, want)
+		}
+	}
+	if got := audioCaptureFragmentTime(AudioCodecAACELD); got != 10885*time.Microsecond {
+		t.Fatalf("AAC-ELD capture fragment = %v, want 10.885ms", got)
+	}
+}
+
+func TestAudioMonitorSourceSelection(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		hasPulse    bool
+		monitor     string
+		hasPipeWire bool
+		wantSource  string
+		wantArgs    []string
+	}{
+		{
+			name: "Pulse monitor preferred when both plugins exist", hasPulse: true,
+			monitor: "test.monitor", hasPipeWire: true, wantSource: "pulse",
+			wantArgs: []string{"pulsesrc", "device=test.monitor", "buffer-time=50000", "latency-time=7982"},
+		},
+		{
+			name: "native Pulse monitor", hasPulse: true,
+			monitor: "test.monitor", wantSource: "pulse",
+			wantArgs: []string{"pulsesrc", "device=test.monitor", "buffer-time=50000", "latency-time=7982"},
+		},
+		{
+			name: "PipeWire fallback without Pulse plugin", hasPipeWire: true, wantSource: "pipewire",
+			wantArgs: []string{"pipewiresrc", "client-name=doubletake"},
+		},
+		{
+			name: "PipeWire fallback without detected monitor", hasPulse: true,
+			hasPipeWire: true, wantSource: "pipewire",
+			wantArgs: []string{"pipewiresrc", "client-name=doubletake"},
+		},
+		{name: "no source plugin", wantSource: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args, source := selectAudioMonitorSource(test.hasPulse, test.monitor, test.hasPipeWire, AudioCodecALAC)
+			if source != test.wantSource {
+				t.Fatalf("source = %q, want %q", source, test.wantSource)
+			}
+			if got := strings.Join(args, " "); got != strings.Join(test.wantArgs, " ") {
+				t.Fatalf("args = %q, want %q", got, strings.Join(test.wantArgs, " "))
+			}
+		})
+	}
+}
+
 func TestAudioCaptureTestToneCarriesSourcePTSWithoutHardware(t *testing.T) {
 	if _, err := exec.LookPath("gst-launch-1.0"); err != nil || !supportsTimestampedAudioOutput() || !hasGstElement("audiotestsrc") {
 		t.Skip("timestamped GStreamer test elements are unavailable")
@@ -65,6 +124,14 @@ func TestAudioCaptureTestToneCarriesSourcePTSWithoutHardware(t *testing.T) {
 	}
 	if age := time.Since(position.PTS); age < -time.Second || age > 2*time.Second {
 		t.Fatalf("test-tone source PTS age = %v, want a current capture time", age)
+	}
+	reader, ok := capture.pcmFrames.(*rtpL16PCMFrameReader)
+	if !ok {
+		t.Fatalf("timestamped capture reader = %T, want RTP/L16 reader", capture.pcmFrames)
+	}
+	if reader.reportPackets != 1 || reader.reportSamples != 352 {
+		t.Fatalf("first codec frame used %d RTP packets and %d samples, want one 352-sample source callback",
+			reader.reportPackets, reader.reportSamples)
 	}
 	_, second, err := capture.readFramePosition(buf)
 	if err != nil {
@@ -230,10 +297,12 @@ func TestAudioRTPClockUsesCapturedSampleClockWithoutLongTermWallDrift(t *testing
 	if wallDerived := epoch + uint32(durationToAudioSamples(elapsedWall)); wallDerived == last {
 		t.Fatal("test clock did not create a measurable wall/sample-rate difference")
 	}
-	announcedAt := lastPosition.PTS.Add(5 * time.Millisecond)
-	wantRTP := last + uint32(durationToAudioSamples(5*time.Millisecond))
-	if got, ok := clock.rtpAt(announcedAt); !ok || got != wantRTP {
-		t.Fatalf("RTP announce = %#x ok=%t, want %#x true", got, ok, wantRTP)
+	announceAt := lastPosition.PTS.Add(137 * time.Millisecond)
+	announcedRTP, ok := clock.rtpAt(announceAt)
+	wantAnnouncedRTP := last + uint32(durationToAudioSamples(137*time.Millisecond))
+	if !ok || announcedRTP != wantAnnouncedRTP {
+		t.Fatalf("current interpolation = rtp %#x ok=%t, want %#x true",
+			announcedRTP, ok, wantAnnouncedRTP)
 	}
 }
 
@@ -276,7 +345,7 @@ func TestAudioClockAtNTPFallbackIncludesNTP1900Epoch(t *testing.T) {
 	}
 }
 
-func TestSendSyncPacketAtUsesExplicitSourceRTP(t *testing.T) {
+func TestSendSyncPacketAtUsesExplicitSourceRTPForPlayhead(t *testing.T) {
 	stream := &AudioStream{rtpTime: 123, latencySamples: 1000}
 	conn := &recordingPacketConn{}
 	stream.ctrlConn = conn
@@ -288,8 +357,8 @@ func TestSendSyncPacketAtUsesExplicitSourceRTP(t *testing.T) {
 	if got := binary.BigEndian.Uint32(packet[4:8]); got != 6000 {
 		t.Fatalf("playback RTP = %d, want 6000", got)
 	}
-	if got := binary.BigEndian.Uint32(packet[16:20]); got != 7000 {
-		t.Fatalf("apply RTP = %d, want explicit source RTP 7000", got)
+	if got := binary.BigEndian.Uint32(packet[16:20]); got != 6000 {
+		t.Fatalf("apply RTP = %d, want latency-adjusted playhead 6000", got)
 	}
 }
 
@@ -308,6 +377,9 @@ func TestAudioFrameStalenessRequiresPositivePlayoutLead(t *testing.T) {
 	}
 	if audioFrameIsStale(time.Time{}, now, latency, 0) {
 		t.Fatal("raw fallback frame with no PTS was classified stale")
+	}
+	if !audioFrameIsStale(now.Add(-90*time.Millisecond), now, latency, 13*time.Millisecond) {
+		t.Fatal("frame without enough lead for pacing was not classified stale")
 	}
 }
 

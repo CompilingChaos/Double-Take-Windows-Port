@@ -4,6 +4,7 @@ package airplay
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -88,6 +89,13 @@ func ValidateHWAccel(method string) error {
 	}
 }
 
+// pipeWireSourceHasProvideClock reports whether the installed pipewiresrc
+// exposes provide-clock. Older plugins reject unknown properties at launch.
+var pipeWireSourceHasProvideClock = sync.OnceValue(func() bool {
+	out, err := exec.Command("gst-inspect-1.0", "pipewiresrc").Output()
+	return err == nil && bytes.Contains(out, []byte("provide-clock"))
+})
+
 func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture, error) {
 	// Check dependencies
 	if err := exec.Command("gst-inspect-1.0", "pipewiresrc").Run(); err != nil {
@@ -122,11 +130,20 @@ func startWaylandCapture(ctx context.Context, cfg CaptureConfig) (*ScreenCapture
 	gstArgs := []string{
 		"--quiet",
 		"pipewiresrc", fmt.Sprintf("fd=%d", pwFdNum), fmt.Sprintf("path=%d", nodeID), "do-timestamp=true",
+	}
+	if pipeWireSourceHasProvideClock() {
+		// When pipewiresrc provides the pipeline clock, capture timestamps drift
+		// from the system clock. videorate then drops frames against the wrong
+		// clock and the receiver stops presenting them, freezing the mirror.
+		// (Port of upstream de2df58.)
+		gstArgs = append(gstArgs, "provide-clock=false")
+	}
+	gstArgs = append(gstArgs,
 		"!", "videoconvert",
 		"!", "videorate", "drop-only=true", "skip-to-first=true",
 		"!", fmt.Sprintf("video/x-raw,framerate=%d/1", fps),
 		"!", "queue", "max-size-buffers=1", "max-size-bytes=0", "max-size-time=0", "leaky=downstream",
-	}
+	)
 	gstArgs = appendReceiverScale(gstArgs, cfg)
 	if encoderParts.needsVulkan {
 		gstArgs = append(gstArgs, "!", "vulkanupload")

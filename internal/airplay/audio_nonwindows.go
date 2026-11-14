@@ -8,7 +8,6 @@ import (
 	"log"
 	"os/exec"
 	"strings"
-	"time"
 )
 
 // StartAudioCapture launches a pipeline that captures system audio and feeds
@@ -23,30 +22,29 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 
 	var srcArgs []string
 	if testTone {
-		srcArgs = []string{"audiotestsrc", "wave=sine", "freq=440", "is-live=true",
-			fmt.Sprintf("samplesperbuffer=%d", codecSPF)}
-		dbg("[AUDIO] using test tone (440 Hz sine wave, live, spf=%d)", codecSPF)
-	} else if hasGstElement("pulsesrc") {
-		monitor := detectPulseMonitor(ctx)
-		if monitor == "" {
-			cancel()
-			return nil, fmt.Errorf("no PulseAudio monitor source found")
-		}
-		// Ask the sound server for roughly one codec frame per callback.
-		// Keep enough capacity in its ring to absorb a scheduler stall.
-		fragmentMicros := (codecSPF*int64(time.Second/time.Microsecond) + audioSampleRate - 1) / audioSampleRate
-		srcArgs = []string{
-			"pulsesrc", "device=" + monitor,
-			fmt.Sprintf("buffer-time=%d", audioCaptureStallBuffer/time.Microsecond),
-			fmt.Sprintf("latency-time=%d", fragmentMicros),
-		}
-		dbg("[AUDIO] using pulsesrc device=%s", monitor)
-	} else if hasGstElement("pipewiresrc") {
-		srcArgs = []string{"pipewiresrc", "client-name=doubletake"}
-		dbg("[AUDIO] using pipewiresrc")
+		srcArgs = []string{"audiotestsrc", "wave=sine", "freq=440",
+			fmt.Sprintf("volume=%g", audioTestToneAmplitude),
+			"is-live=true", fmt.Sprintf("samplesperbuffer=%d", codecSPF)}
+		dbg("[AUDIO] using test tone (440 Hz sine wave, volume=%g, live, spf=%d)", audioTestToneAmplitude, codecSPF)
 	} else {
-		cancel()
-		return nil, fmt.Errorf("no audio source available (need pulsesrc or pipewiresrc)")
+		hasPulseSource := hasGstElement("pulsesrc")
+		hasPipeWireSource := hasGstElement("pipewiresrc")
+		monitor := ""
+		if hasPulseSource {
+			monitor = detectPulseMonitor(ctx)
+		}
+		var source string
+		srcArgs, source = selectAudioMonitorSource(hasPulseSource, monitor, hasPipeWireSource, codec)
+		switch source {
+		case "pulse":
+			dbg("[AUDIO] using pulsesrc device=%s (buffer=%s fragment=%s)",
+				monitor, audioPulseDeviceBuffer, audioCaptureFragmentTime(codec))
+		case "pipewire":
+			dbg("[AUDIO] using default pipewiresrc")
+		default:
+			cancel()
+			return nil, fmt.Errorf("no audio source available (need pulsesrc or pipewiresrc)")
+		}
 	}
 
 	ac := &AudioCapture{
@@ -54,7 +52,10 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 		waitCh: make(chan struct{}),
 		codec:  codec,
 	}
-	if codec == AudioCodecAACELD {
+	if codec == AudioCodecALAC {
+		ac.alac = &alacEncoder{}
+		dbg("[AUDIO] using compressed ALAC")
+	} else if codec == AudioCodecAACELD {
 		var err error
 		ac.eld, err = newELDEncoder()
 		if err != nil {
