@@ -24,7 +24,8 @@ directly with `./doubletake-gui`. For the portable or source build, install the
 runtime dependencies:
 
 ```sh
-sudo apt install libwebkit2gtk-4.1-0 libxi6 gstreamer1.0-tools \
+sudo apt install libwayland-client0 libwayland-cursor0 libx11-xcb1 libxkbcommon-x11-0 \
+  libegl1 libgles2 libffi8 libxcursor1 libvulkan1 libxi6 gstreamer1.0-tools \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly pulseaudio-utils x11-xserver-utils
 ```
@@ -38,7 +39,8 @@ PulseAudio or PipeWire-Pulse output, and local playback continues while streamin
 To install from source for your user, install Go 1.25+ and run:
 
 ```sh
-sudo apt install build-essential pkg-config libwebkit2gtk-4.1-dev libxi-dev desktop-file-utils
+sudo apt install build-essential pkg-config libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+  libegl-dev libgles-dev libffi-dev libxcursor-dev libvulkan-dev libxi-dev desktop-file-utils
 make install PREFIX="$HOME/.local" DATADIR="${XDG_DATA_HOME:-$HOME/.local/share}"
 ```
 
@@ -47,7 +49,7 @@ This also adds the application menu entry. Use `make uninstall` with the same
 
 ## Windows
 
-Install Microsoft Edge WebView2 Runtime and FFmpeg. FFmpeg can be on `PATH` or
+Install FFmpeg. FFmpeg can be on `PATH` or
 next to the DoubleTake executables. Install FFmpeg with WinGet:
 
 ```powershell
@@ -66,6 +68,9 @@ of the default speakers. It mutes the local playback endpoint during audio
 mirroring and restores its previous mute state when capture ends.
 
 ## Desktop controls
+
+The desktop app follows the system language and supports English and German.
+Set `DOUBLETAKE_LANG=en` or `DOUBLETAKE_LANG=de` before launching to override it.
 
 Choose a receiver and enter its pairing PIN or configured password if prompted.
 DoubleTake saves pairing credentials for later connections. Receiver audio

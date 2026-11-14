@@ -3,74 +3,64 @@
 package main
 
 import (
-	"fmt"
 	"os"
-	"path/filepath"
-	"runtime"
 	"unsafe"
 
 	"doubletake/internal/airplay"
-
-	webview2 "github.com/jchv/go-webview2"
+	"gioui.org/app"
 	"golang.org/x/sys/windows"
 )
 
 func main() {
-	runtime.LockOSThread()
+	go func() {
+		if err := run(); err != nil {
+			showFatalWindow(err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}()
+	app.Main()
+}
+
+func run() error {
 	airplay.RestoreInterruptedSpeakerMute()
-
-	appBackend, err := newBackend("127.0.0.1:0")
+	b, err := newBackend("127.0.0.1:0")
 	if err != nil {
-		showFatalWindow(err)
-		return
+		return err
 	}
-
-	if err := airplay.CheckFFmpeg(); err != nil {
-		appBackend.setError(err)
+	b.setError(airplay.CheckFFmpeg())
+	stop := b.start()
+	defer stop()
+	hook, err := newGlobalEnterHook(b.applyArmedFreeze)
+	if err != nil {
+		b.setError(err)
+	} else {
+		b.hook = hook
+		defer hook.Close()
 	}
+	return runWindow(b)
+}
 
-	cacheDir, _ := os.UserCacheDir()
-	w := webview2.NewWithOptions(webview2.WebViewOptions{
-		Debug:     false,
-		AutoFocus: true,
-		DataPath:  filepath.Join(cacheDir, "DoubleTake", "WebView2"),
-		WindowOptions: webview2.WindowOptions{
-			Title:  "DoubleTake",
-			Width:  1120,
-			Height: 760,
-			IconId: 1,
-			Center: true,
-		},
-	})
-	if w == nil {
-		if systemUILocale() == "de" {
-			showFatalWindow(fmt.Errorf("Microsoft Edge WebView2 konnte nicht gestartet werden"))
+func configureWindow(w *app.Window) {
+	w.Option(app.Maximized.Option())
+}
+
+func configureView(view app.ViewEvent) {
+	if v, ok := view.(app.Win32ViewEvent); ok && v.Valid() {
+		setDarkTitleBar(v.HWND)
+		const wmSetIcon = 0x0080
+		user := windows.NewLazySystemDLL("user32.dll")
+		var module windows.Handle
+		if err := windows.GetModuleHandleEx(0, nil, &module); err != nil {
 			return
 		}
-		showFatalWindow(fmt.Errorf("Microsoft Edge WebView2 could not be started"))
-		return
+		icon, _, _ := user.NewProc("LoadIconW").Call(uintptr(module), 1)
+		if icon != 0 {
+			send := user.NewProc("PostMessageW")
+			send.Call(v.HWND, wmSetIcon, 0, icon)
+			send.Call(v.HWND, wmSetIcon, 1, icon)
+		}
 	}
-	defer w.Destroy()
-	setDarkTitleBar(w.Window())
-	w.SetSize(920, 640, webview2.HintMin)
-	maximizeWindow(w.Window())
-	stop := appBackend.start()
-	defer stop()
-	enterHook, hookErr := newGlobalEnterHook(appBackend.applyArmedFreeze)
-	if hookErr != nil {
-		appBackend.setError(hookErr)
-	} else {
-		appBackend.hook = enterHook
-		defer enterHook.Close()
-	}
-
-	if err := appBackend.bind(w.Bind); err != nil {
-		showFatalWindow(err)
-		return
-	}
-
-	w.SetHtml(localizedHTML(appBackend.hook != nil))
-	w.Run()
 }
 
 func systemUILocale() string {
@@ -84,27 +74,21 @@ func systemUILocale() string {
 	return "en"
 }
 
-func setDarkTitleBar(window unsafe.Pointer) {
+func setDarkTitleBar(window uintptr) {
 	const dwmwaUseImmersiveDarkMode = 20
 	enabled := int32(1)
 	proc := windows.NewLazySystemDLL("dwmapi.dll").NewProc("DwmSetWindowAttribute")
 	_, _, _ = proc.Call(
-		uintptr(window),
+		window,
 		dwmwaUseImmersiveDarkMode,
 		uintptr(unsafe.Pointer(&enabled)),
 		unsafe.Sizeof(enabled),
 	)
 }
 
-func maximizeWindow(window unsafe.Pointer) {
-	const swMaximize = 3
-	proc := windows.NewLazySystemDLL("user32.dll").NewProc("ShowWindow")
-	_, _, _ = proc.Call(uintptr(window), swMaximize)
-}
-
 func showFatalWindow(err error) {
 	message := "DoubleTake could not start:\n\n"
-	if systemUILocale() == "de" {
+	if uiLocale() == "de" {
 		message = "DoubleTake konnte nicht gestartet werden:\n\n"
 	}
 	text, _ := windows.UTF16PtrFromString(message + err.Error())

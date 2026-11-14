@@ -60,6 +60,7 @@ type Request struct {
 type StreamInfo struct {
 	Device         string         `json:"device"`
 	DeviceIP       string         `json:"device_ip"`
+	DeviceID       string         `json:"device_id,omitempty"`
 	State          State          `json:"state"`
 	HasAudio       bool           `json:"has_audio"`
 	AudioMuted     bool           `json:"audio_muted"`
@@ -573,6 +574,7 @@ func (d *Daemon) statusResponseLocked(ok bool, errMsg string) Response {
 		streams = append(streams, StreamInfo{
 			Device:         s.device,
 			DeviceIP:       s.deviceIP,
+			DeviceID:       s.deviceID,
 			State:          s.state,
 			HasAudio:       !s.noAudio && s.session != nil && s.session.AudioEnabled(),
 			AudioMuted:     s.audioMuted,
@@ -667,7 +669,7 @@ func (d *Daemon) handleDiscover() Response {
 	return Response{
 		OK:      true,
 		State:   d.overallStateLocked(),
-		Devices: toDeviceInfos(d.devices),
+		Devices: toDeviceInfos(d.preferredReceiversLocked()),
 	}
 }
 
@@ -677,7 +679,7 @@ func (d *Daemon) handleDevices() Response {
 	return Response{
 		OK:      true,
 		State:   d.overallStateLocked(),
-		Devices: toDeviceInfos(d.devices),
+		Devices: toDeviceInfos(d.preferredReceiversLocked()),
 	}
 }
 
@@ -772,6 +774,11 @@ func (d *Daemon) handleConnect(req Request) Response {
 	if port == 0 {
 		port = 7000
 	}
+	if existing := d.activeReceiverLocked(target, expectedDeviceID); existing != nil {
+		response := Response{OK: false, State: existing.state, Error: "already connected or connecting to " + existing.deviceIP}
+		d.mu.Unlock()
+		return response
+	}
 
 	// Create the context before publishing the entry so a concurrent disconnect
 	// can always cancel the connection goroutine.
@@ -782,6 +789,7 @@ func (d *Daemon) handleConnect(req Request) Response {
 	}
 	entry := &activeStream{
 		deviceIP:     target,
+		deviceID:     expectedDeviceID,
 		state:        StateConnecting,
 		noAudio:      d.cfg.NoAudio || req.NoAudio,
 		startMuted:   req.StartMuted,
@@ -833,12 +841,13 @@ func (d *Daemon) clearLastErrorForTargetLocked(target string) {
 // pickFreeDeviceLocked returns the first discovered device not already in d.streams.
 // Must be called with d.mu held.
 func (d *Daemon) pickFreeDeviceLocked(preferredPort int) (string, int) {
+	devices := d.preferredReceiversLocked()
 	for _, appleTVOnly := range []bool{true, false} {
-		for _, dev := range d.devices {
+		for _, dev := range devices {
 			if isAppleTVDevice(dev) != appleTVOnly {
 				continue
 			}
-			if _, inUse := d.streams[dev.IP]; !inUse {
+			if d.activeReceiverLocked(dev.IP, dev.DeviceID) == nil {
 				p := dev.Port
 				if preferredPort != 0 {
 					p = preferredPort

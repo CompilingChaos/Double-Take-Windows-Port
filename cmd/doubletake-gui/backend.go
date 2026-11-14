@@ -5,10 +5,7 @@ package main
 import (
 	"context"
 	_ "embed"
-	"encoding/base64"
 	"fmt"
-	"strconv"
-	"strings"
 	"sync"
 
 	"doubletake/internal/airplay"
@@ -20,9 +17,6 @@ type freezeHook interface {
 	Arm(target string, frozen bool) error
 	Disarm(target string)
 }
-
-//go:embed ui.html
-var appHTML string
 
 //go:embed icon-ui.png
 var appIcon []byte
@@ -36,11 +30,11 @@ type backend struct {
 }
 
 type snapshot struct {
-	Status            daemon.Response     `json:"status"`
-	Devices           []daemon.DeviceInfo `json:"devices"`
-	FreezeArmedTarget string              `json:"freeze_armed_target,omitempty"`
-	FreezeArmedAction bool                `json:"freeze_armed_action"`
-	SystemMessage     string              `json:"system_message,omitempty"`
+	Status            daemon.Response
+	Devices           []daemon.DeviceInfo
+	FreezeArmedTarget string
+	FreezeArmedAction bool
+	SystemMessage     string
 }
 
 func (b *backend) setError(err error) {
@@ -93,7 +87,7 @@ func (b *backend) armFreeze(target string, frozen bool) error {
 			return b.freezeControl().Arm(target, frozen)
 		}
 	}
-	if systemUILocale() == "de" {
+	if uiLocale() == "de" {
 		return fmt.Errorf("Übertragung zu %s ist noch nicht bereit", target)
 	}
 	return fmt.Errorf("stream to %s is not ready to change freeze state", target)
@@ -127,7 +121,7 @@ func (b *backend) applyArmedFreeze(target string, frozen bool) {
 	if response.OK {
 		return
 	}
-	if systemUILocale() == "de" {
+	if uiLocale() == "de" {
 		b.setError(fmt.Errorf("Einfrierzustand für %s konnte nicht geändert werden: %s", target, response.Error))
 	} else {
 		b.setError(fmt.Errorf("change freeze state for %s: %s", target, response.Error))
@@ -162,7 +156,7 @@ func (b *backend) start() func() {
 	go func() {
 		defer close(done)
 		if err := b.daemon.Run(ctx); err != nil && ctx.Err() == nil {
-			if systemUILocale() == "de" {
+			if uiLocale() == "de" {
 				b.setError(fmt.Errorf("Hintergrunddienst wurde beendet: %w", err))
 			} else {
 				b.setError(fmt.Errorf("background service stopped: %w", err))
@@ -174,34 +168,4 @@ func (b *backend) start() func() {
 		b.daemon.Shutdown()
 		<-done
 	}
-}
-
-func (b *backend) bind(bind func(string, any) error) error {
-	for _, binding := range []struct {
-		name string
-		fn   any
-	}{
-		{"getAppState", b.state},
-		{"connectDevice", b.connect},
-		{"submitCredential", b.submitCredential},
-		{"disconnectDevice", b.disconnect},
-		{"setStreamVolume", b.setVolume},
-		{"setStreamMuted", b.setMuted},
-		{"focusedEnter", b.focusedEnter},
-		{"armGlobalFreeze", b.armFreeze},
-		{"disarmGlobalFreeze", b.disarmFreeze},
-	} {
-		if err := bind(binding.name, binding.fn); err != nil {
-			return fmt.Errorf("bind %s: %w", binding.name, err)
-		}
-	}
-	return nil
-}
-
-func localizedHTML(globalFreeze bool) string {
-	return strings.NewReplacer(
-		"__DOUBLETAKE_ICON__", "data:image/png;base64,"+base64.StdEncoding.EncodeToString(appIcon),
-		"__DOUBLETAKE_LOCALE__", systemUILocale(),
-		"__DOUBLETAKE_GLOBAL_FREEZE__", strconv.FormatBool(globalFreeze),
-	).Replace(appHTML)
 }

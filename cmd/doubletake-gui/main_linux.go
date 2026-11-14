@@ -10,31 +10,20 @@ import (
 	"path/filepath"
 	"strings"
 
-	webview "github.com/samcharles93/webview_go"
+	"gioui.org/app"
 )
 
 func main() {
-	if err := run(); err != nil {
-		log.Fatal(err)
-	}
+	go func() {
+		if err := run(); err != nil {
+			log.Fatal(err)
+		}
+		os.Exit(0)
+	}()
+	app.Main()
 }
 
 func run() error {
-	w := webview.New(false)
-	if w == nil {
-		return fmt.Errorf("could not open the DoubleTake window; run it from an X11 or Wayland desktop session")
-	}
-	defer w.Destroy()
-	if err := w.SetTitle("DoubleTake"); err != nil {
-		return fmt.Errorf("set window title: %w", err)
-	}
-	if err := w.SetSize(1120, 760, webview.HintNone); err != nil {
-		return fmt.Errorf("set window size: %w", err)
-	}
-	if err := w.SetSize(920, 640, webview.HintMin); err != nil {
-		return fmt.Errorf("set minimum window size: %w", err)
-	}
-
 	dir, err := os.MkdirTemp("", "doubletake-")
 	if err != nil {
 		return err
@@ -59,14 +48,11 @@ func run() error {
 		app.hook = enterHook
 		defer enterHook.Close()
 	}
-	if err := app.bind(w.Bind); err != nil {
-		return err
-	}
-	if err := w.SetHtml(localizedHTML(app.hook != nil)); err != nil {
-		return fmt.Errorf("load desktop interface: %w", err)
-	}
-	return w.Run()
+	return runWindow(app)
 }
+
+func configureWindow(*app.Window) {}
+func configureView(app.ViewEvent) {}
 
 func systemUILocale() string {
 	for _, name := range []string{"LC_ALL", "LC_MESSAGES", "LANG"} {
