@@ -73,7 +73,7 @@ func main() {
 		hwaccelHelp = "Hardware acceleration: auto, nvenc, none"
 	}
 	hwaccel := flag.String("hwaccel", "auto", hwaccelHelp)
-	videoCodec := flag.String("video-codec", "auto", "Screen codec: auto, h264, or hevc (auto uses hardware HEVC for capable high-resolution receivers)")
+	videoCodec := flag.String("video-codec", "auto", "Screen codec: auto, h264, or hevc (auto uses H.264 for receiver compatibility)")
 	testMode := flag.Bool("test", false, "Use synthetic video instead of screen capture for debugging")
 	noEncrypt := flag.Bool("no-encrypt", false, "Disable RTSP header encryption (debugging only; video frames are always encrypted)")
 	directKey := flag.Bool("direct-key", false, "Use shk/shiv directly without SHA-512 derivation")
@@ -378,15 +378,14 @@ func main() {
 	}
 
 	streamCfg := airplay.StreamConfig{
-		FPS:                    *fps,
-		Bitrate:                *bitrate,
-		VideoCodec:             airplay.VideoCodec(*videoCodec),
-		AutomaticHEVCAvailable: airplay.AutomaticHEVCAvailable(*hwaccel),
-		NoEncrypt:              *noEncrypt,
-		DirectKey:              *directKey,
-		NoAudio:                *noAudio,
-		PortMin:                portMin,
-		PortMax:                portMax,
+		FPS:        *fps,
+		Bitrate:    *bitrate,
+		VideoCodec: airplay.VideoCodec(*videoCodec),
+		NoEncrypt:  *noEncrypt,
+		DirectKey:  *directKey,
+		NoAudio:    *noAudio,
+		PortMin:    portMin,
+		PortMax:    portMax,
 	}
 	var captureWidth, captureHeight int
 	var captureCodec airplay.VideoCodec

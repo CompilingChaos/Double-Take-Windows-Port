@@ -87,11 +87,11 @@ Windows supports \fBauto\fR, \fBnvenc\fR, and \fBnone\fR. Linux also supports
 the GStreamer VA-API and OpenH264 methods. The default is \fBauto\fR.
 .TP
 .B \-video-codec \fICODEC\fR
-Screen codec: capability-driven \fBauto\fR (default), forced \fBh264\fR, or
-forced \fBhevc\fR. Automatic HEVC requires receiver feature 42, a session-time
-maximum above 1920x1080, and an available local hardware Main10 path;
-otherwise it uses H.264 at the nominal canvas. On Windows, forced HEVC may also
-use libx265. The split Linux adapter in this port retains H.264 capture.
+Screen codec: compatible H.264 \fBauto\fR (default), forced \fBh264\fR, or
+forced \fBhevc\fR. Automatic mode uses H.264 at the receiver's nominal canvas.
+Forced HEVC uses the receiver's maximum canvas and may also use x265.
+On Windows, forced HEVC may also use libx265. The split Linux adapter in this
+port retains H.264 capture.
 Main10 output does not fabricate HDR metadata for an SDR capture source.
 .TP
 .B \-no-cursor

@@ -55,10 +55,10 @@ type videoSelection struct {
 }
 
 // selectVideo chooses one concrete codec and canvas from the final receiver
-// snapshot. Apple's sender treats SupportsScreenMultiCodec (feature 42), a
-// maximum above 1080p, and local HEVC-4K support as independent gates. Auto
-// follows that shape; explicit codec requests remain deterministic.
+// snapshot. The interoperable screen sender path uses AVC at the receiver's
+// nominal canvas. HEVC remains an explicit diagnostic override.
 func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable bool) (videoSelection, error) {
+	_ = automaticHEVCAvailable // Retained for programmatic compatibility.
 	if requested == "" {
 		requested = VideoCodecH264
 	}
@@ -77,20 +77,11 @@ func (i *ReceiverInfo) selectVideo(requested VideoCodec, automaticHEVCAvailable 
 		}
 		return videoSelection{codec: VideoCodecHEVC, width: width, height: height, reason: "explicit HEVC"}, nil
 	case VideoCodecAuto:
-		if !automaticHEVCAvailable {
-			width, height := i.h264VideoCanvas()
-			return videoSelection{codec: VideoCodecH264, width: width, height: height, reason: "local hardware HEVC path unavailable"}, nil
-		}
-		if !i.supportsVideoCodec(VideoCodecHEVC) {
-			width, height := i.h264VideoCanvas()
-			return videoSelection{codec: VideoCodecH264, width: width, height: height, reason: "receiver lacks feature 42"}, nil
-		}
-		width, height, ok := i.highResolutionVideoCanvas()
-		if !ok {
-			width, height = i.h264VideoCanvas()
-			return videoSelection{codec: VideoCodecH264, width: width, height: height, reason: "receiver maximum does not exceed 1080p"}, nil
-		}
-		return videoSelection{codec: VideoCodecHEVC, width: width, height: height, reason: "feature 42, high-resolution maximum, and local hardware HEVC"}, nil
+		// The interoperable screen sender path uses AVC. HEVC remains an
+		// explicit request. The port keeps its own H.264 canvas choice (a larger
+		// canvas for Mac receivers).
+		width, height := i.h264VideoCanvas()
+		return videoSelection{codec: VideoCodecH264, width: width, height: height, reason: "automatic compatibility path"}, nil
 	default:
 		panic("validated video codec has no selection policy")
 	}

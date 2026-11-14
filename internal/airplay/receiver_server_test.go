@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -396,7 +397,7 @@ func TestSetupMirrorPreparesVideoFromSessionDisplayInfo(t *testing.T) {
 	}
 }
 
-func TestSetupMirrorAutomaticallySelectsHEVCFromSessionDisplayInfo(t *testing.T) {
+func TestSetupMirrorAutomaticallySelectsNominalH264FromSessionDisplayInfo(t *testing.T) {
 	SetTargetLatency(0)
 	t.Cleanup(func() { SetTargetLatency(0) })
 	_, client, ctx := newReceiverServerTestPair(t, ReceiverConfig{Profile: ReceiverProfileModern})
@@ -417,8 +418,8 @@ func TestSetupMirrorAutomaticallySelectsHEVCFromSessionDisplayInfo(t *testing.T)
 		MeasuredVideoLatency:   150 * time.Millisecond,
 	}, func(width, height int, codec VideoCodec) error {
 		callbackCount++
-		if codec != VideoCodecHEVC || width != 3840 || height != 2160 {
-			return fmt.Errorf("automatic selection = %s %dx%d, want HEVC 3840x2160", codec, width, height)
+		if codec != VideoCodecH264 || width != 1920 || height != 1080 {
+			return fmt.Errorf("automatic selection = %s %dx%d, want H.264 1920x1080", codec, width, height)
 		}
 		return nil
 	})
@@ -429,14 +430,59 @@ func TestSetupMirrorAutomaticallySelectsHEVCFromSessionDisplayInfo(t *testing.T)
 	if callbackCount != 1 {
 		t.Fatalf("video preparation callbacks = %d, want 1", callbackCount)
 	}
-	if session.videoCodec != VideoCodecHEVC {
-		t.Fatalf("session codec = %s, want HEVC", session.videoCodec)
+	if session.videoCodec != VideoCodecH264 {
+		t.Fatalf("session codec = %s, want H.264", session.videoCodec)
 	}
-	if session.timestampBias != 150*time.Millisecond {
-		t.Fatalf("session video lead = %v, want calibrated 150ms", session.timestampBias)
+	if session.timestampBias != defaultVideoLatencyNormal {
+		t.Fatalf("session video lead = %v, want %v", session.timestampBias, defaultVideoLatencyNormal)
 	}
-	if session.audioStream == nil || session.audioStream.latencySamples != samplesFor44k1(160*time.Millisecond) {
-		t.Fatalf("session audio lead = %#v, want calibrated 160ms (%d samples)", session.audioStream, samplesFor44k1(160*time.Millisecond))
+	if session.audioStream == nil || session.audioStream.latencySamples != samplesFor44k1(defaultAudioLatencyNormal) {
+		t.Fatalf("session audio lead = %#v, want %d samples", session.audioStream, samplesFor44k1(defaultAudioLatencyNormal))
+	}
+}
+
+func TestAutomaticVideoPreparationStartsNominalH264(t *testing.T) {
+	SetTargetLatency(0)
+	t.Cleanup(func() { SetTargetLatency(0) })
+	server, client, ctx := newReceiverServerTestPair(t, ReceiverConfig{Profile: ReceiverProfileModern})
+	if err := client.Pair(ctx, ""); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	if err := client.FairPlaySetup(ctx); err != nil {
+		t.Fatalf("FairPlay setup: %v", err)
+	}
+
+	type preparation struct {
+		codec         VideoCodec
+		width, height int
+	}
+	var attempts []preparation
+	session, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, StreamConfig{
+		VideoCodec:             VideoCodecAuto,
+		AutomaticHEVCAvailable: true,
+		MeasuredVideoLatency:   160 * time.Millisecond,
+	}, func(width, height int, codec VideoCodec) (VideoPreparationResult, error) {
+		attempts = append(attempts, preparation{codec: codec, width: width, height: height})
+		return VideoPreparationResult{}, nil
+	})
+	if err != nil {
+		t.Fatalf("setup mirror: %v", err)
+	}
+	defer session.Close()
+	want := []preparation{
+		{codec: VideoCodecH264, width: 1920, height: 1080},
+	}
+	if !reflect.DeepEqual(attempts, want) {
+		t.Fatalf("video preparation attempts = %#v, want %#v", attempts, want)
+	}
+	if session.videoCodec != VideoCodecH264 || session.timestampBias != defaultVideoLatencyNormal {
+		t.Fatalf("fallback session = codec %s lead %v, want H.264/%v", session.videoCodec, session.timestampBias, defaultVideoLatencyNormal)
+	}
+	if session.audioStream == nil || session.audioStream.latencySamples != samplesFor44k1(defaultAudioLatencyNormal) {
+		t.Fatalf("fallback audio lead = %#v, want %d samples", session.audioStream, samplesFor44k1(defaultAudioLatencyNormal))
+	}
+	if got := server.Stats().SetupRequests; got != 3 {
+		t.Fatalf("completed setup requests = %d, want 3", got)
 	}
 }
 
@@ -474,7 +520,7 @@ func TestLiveHEVCCaptureLeadIsCommittedBeforeMediaSetup(t *testing.T) {
 				t.Fatalf("FairPlay setup: %v", err)
 			}
 			session, err := client.SetupMirrorWithCalibratedVideoPreparation(ctx, StreamConfig{
-				VideoCodec:             VideoCodecAuto,
+				VideoCodec:             VideoCodecHEVC,
 				AutomaticHEVCAvailable: true,
 				MeasuredVideoLatency:   test.preflight,
 			}, func(_, _ int, codec VideoCodec) (VideoPreparationResult, error) {
@@ -512,7 +558,7 @@ func TestMeasuredHEVCLatencyIsScopedAndExplicitOverrideWins(t *testing.T) {
 			wantCodec: VideoCodecH264, wantVideoLead: 75 * time.Millisecond, wantAudioLead: 85 * time.Millisecond,
 		},
 		{
-			name: "joint override wins", requested: VideoCodecAuto, override: 100 * time.Millisecond,
+			name: "joint override wins", requested: VideoCodecHEVC, override: 100 * time.Millisecond,
 			wantCodec: VideoCodecHEVC, wantVideoLead: 100 * time.Millisecond, wantAudioLead: 100 * time.Millisecond,
 		},
 	}
@@ -552,7 +598,9 @@ func TestMeasuredHEVCLatencyIsScopedAndExplicitOverrideWins(t *testing.T) {
 	}
 }
 
-func TestMediaFirstAutoUsesHEVCWhenCommittedNTPLatencyIsSufficient(t *testing.T) {
+// Automatic selection now always uses H.264; an explicit HEVC request must
+// still fit its measured capture lead inside the committed NTP lead.
+func TestMediaFirstExplicitHEVCFitsCommittedNTPLatency(t *testing.T) {
 	SetTargetLatency(0)
 	t.Cleanup(func() { SetTargetLatency(0) })
 	_, client, ctx := newReceiverServerTestPair(t, ReceiverConfig{
@@ -562,9 +610,8 @@ func TestMediaFirstAutoUsesHEVCWhenCommittedNTPLatencyIsSufficient(t *testing.T)
 		t.Fatalf("pair: %v", err)
 	}
 	session, err := client.SetupMirrorWithVideoCodecPreparation(ctx, StreamConfig{
-		VideoCodec:             VideoCodecAuto,
-		AutomaticHEVCAvailable: true,
-		MeasuredVideoLatency:   150 * time.Millisecond,
+		VideoCodec:           VideoCodecHEVC,
+		MeasuredVideoLatency: 150 * time.Millisecond,
 	}, func(_, _ int, codec VideoCodec) error {
 		if codec != VideoCodecHEVC {
 			return fmt.Errorf("media-first codec = %s, want HEVC within the committed NTP lead", codec)
