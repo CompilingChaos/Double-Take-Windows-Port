@@ -105,6 +105,7 @@ func main() {
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
 
 	airplay.SetDebugMode(*debug)
+	airplay.RestoreInterruptedSpeakerMute()
 	credential := credentialFlag
 	if env := os.Getenv("DOUBLETAKE_CODE"); env != "" {
 		credential = env

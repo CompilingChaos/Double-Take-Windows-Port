@@ -3,7 +3,14 @@
 package airplay
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -117,6 +124,13 @@ func muteLocalSpeakers(device *iMMDevice) (func(), error) {
 		return func() { restoreLocalSpeakers(device, id) }, nil
 	}
 
+	// A previous DoubleTake process may have died while it held this endpoint
+	// muted. Restore that first, so the state recorded below is the user's own.
+	if enumerator, err := newMMDeviceEnumerator(); err == nil {
+		recoverInterruptedSpeakerMutes(enumerator)
+		release(unsafe.Pointer(enumerator))
+	}
+
 	volume, err := device.activateEndpointVolume()
 	if err != nil {
 		return nil, err
@@ -127,7 +141,11 @@ func muteLocalSpeakers(device *iMMDevice) (func(), error) {
 		return nil, err
 	}
 	if !wasMuted {
+		// Record the mute before applying it: if this process is killed, the
+		// next DoubleTake start can still return the speakers to the user.
+		recordSpeakerMute(id)
 		if err := volume.setMute(true); err != nil {
+			clearSpeakerMute(id)
 			return nil, err
 		}
 	}
@@ -158,5 +176,219 @@ func restoreLocalSpeakers(device *iMMDevice, id string) {
 	defer release(unsafe.Pointer(volume))
 	if err := volume.setMute(false); err != nil {
 		dbg("[AUDIO] restore local speakers: %v", err)
+		return
 	}
+	clearSpeakerMute(id)
+}
+
+// RestoreInterruptedSpeakerMute unmutes speakers that a DoubleTake process
+// muted for audio streaming and could not restore because it was killed,
+// crashed, or was ended by a Windows shutdown. Endpoint mute persists across
+// reboots, so without this the user's speakers would stay silent.
+func RestoreInterruptedSpeakerMute() {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		initialized, err := coInitialize()
+		if err != nil {
+			return
+		}
+		if initialized {
+			defer procCoUninitialize.Call()
+		}
+		enumerator, err := newMMDeviceEnumerator()
+		if err != nil {
+			return
+		}
+		defer release(unsafe.Pointer(enumerator))
+		speakerMutes.Lock()
+		defer speakerMutes.Unlock()
+		recoverInterruptedSpeakerMutes(enumerator)
+	}()
+	<-done
+}
+
+// recoverInterruptedSpeakerMutes must be called with speakerMutes held on a
+// COM-initialized thread.
+func recoverInterruptedSpeakerMutes(enumerator *iMMDeviceEnumerator) {
+	markers := readSpeakerMuteMarkers()
+	if len(markers) == 0 {
+		return
+	}
+	stale, keep := splitStaleSpeakerMuteMarkers(markers, os.Getpid(), doubleTakeProcessRunning)
+	if len(stale) == 0 {
+		return
+	}
+	for _, marker := range stale {
+		if err := unmuteEndpoint(enumerator, marker.Device); err != nil {
+			dbg("[AUDIO] restore speakers muted by interrupted session: %v", err)
+			continue
+		}
+		log.Printf("[AUDIO] restored speakers left muted by an interrupted DoubleTake session")
+	}
+	writeSpeakerMuteMarkers(keep)
+}
+
+func unmuteEndpoint(enumerator *iMMDeviceEnumerator, id string) error {
+	device, err := enumerator.getDevice(id)
+	if err != nil {
+		return err
+	}
+	defer release(unsafe.Pointer(device))
+	volume, err := device.activateEndpointVolume()
+	if err != nil {
+		return err
+	}
+	defer release(unsafe.Pointer(volume))
+	return volume.setMute(false)
+}
+
+func (e *iMMDeviceEnumerator) getDevice(id string) (*iMMDevice, error) {
+	wideID, err := windows.UTF16PtrFromString(id)
+	if err != nil {
+		return nil, err
+	}
+	var ptr unsafe.Pointer
+	hr, _, _ := syscall.SyscallN(e.lpVtbl.GetDevice,
+		uintptr(unsafe.Pointer(e)),
+		uintptr(unsafe.Pointer(wideID)),
+		uintptr(unsafe.Pointer(&ptr)),
+	)
+	if failed(hr) {
+		return nil, fmt.Errorf("IMMDeviceEnumerator.GetDevice: %s", hresultString(hr))
+	}
+	if ptr == nil {
+		return nil, fmt.Errorf("IMMDeviceEnumerator.GetDevice returned no device")
+	}
+	return (*iMMDevice)(ptr), nil
+}
+
+// speakerMuteMarker records an endpoint this process muted.
+type speakerMuteMarker struct {
+	PID    int    `json:"pid"`
+	Device string `json:"device"`
+}
+
+var speakerMuteMarkerPath = func() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "DoubleTake", "speaker-mute.json")
+}
+
+func readSpeakerMuteMarkers() []speakerMuteMarker {
+	path := speakerMuteMarkerPath()
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var markers []speakerMuteMarker
+	if err := json.Unmarshal(data, &markers); err != nil {
+		dbg("[AUDIO] ignoring unreadable speaker mute record %s: %v", path, err)
+		return nil
+	}
+	return markers
+}
+
+func writeSpeakerMuteMarkers(markers []speakerMuteMarker) {
+	path := speakerMuteMarkerPath()
+	if path == "" {
+		return
+	}
+	if len(markers) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			dbg("[AUDIO] remove speaker mute record: %v", err)
+		}
+		return
+	}
+	data, err := json.Marshal(markers)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		dbg("[AUDIO] create speaker mute record: %v", err)
+		return
+	}
+	temporary := path + ".tmp"
+	if err := os.WriteFile(temporary, data, 0o600); err != nil {
+		dbg("[AUDIO] write speaker mute record: %v", err)
+		return
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		dbg("[AUDIO] write speaker mute record: %v", err)
+	}
+}
+
+func recordSpeakerMute(device string) {
+	markers := withoutSpeakerMuteMarker(readSpeakerMuteMarkers(), os.Getpid(), device)
+	writeSpeakerMuteMarkers(append(markers, speakerMuteMarker{PID: os.Getpid(), Device: device}))
+}
+
+func clearSpeakerMute(device string) {
+	writeSpeakerMuteMarkers(withoutSpeakerMuteMarker(readSpeakerMuteMarkers(), os.Getpid(), device))
+}
+
+func withoutSpeakerMuteMarker(markers []speakerMuteMarker, pid int, device string) []speakerMuteMarker {
+	kept := markers[:0:0]
+	for _, marker := range markers {
+		if marker.PID != pid || marker.Device != device {
+			kept = append(kept, marker)
+		}
+	}
+	return kept
+}
+
+// splitStaleSpeakerMuteMarkers separates mutes whose owning process is gone
+// from those still held by this or another running DoubleTake process. When
+// several stale records name one endpoint, it is restored once.
+func splitStaleSpeakerMuteMarkers(markers []speakerMuteMarker, self int, running func(int) bool) (stale, keep []speakerMuteMarker) {
+	seen := map[string]bool{}
+	for _, marker := range markers {
+		if marker.Device == "" {
+			continue
+		}
+		if marker.PID == self || running(marker.PID) {
+			keep = append(keep, marker)
+			continue
+		}
+		if !seen[marker.Device] {
+			seen[marker.Device] = true
+			stale = append(stale, marker)
+		}
+	}
+	return stale, keep
+}
+
+// doubleTakeProcessRunning reports whether pid is a live DoubleTake process.
+// Checking the executable name keeps a reused process ID from holding a stale
+// mute forever. A process that cannot be inspected is assumed to be running.
+func doubleTakeProcessRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return errors.Is(err, windows.ERROR_ACCESS_DENIED)
+	}
+	defer windows.CloseHandle(handle)
+	var exitCode uint32
+	if err := windows.GetExitCodeProcess(handle, &exitCode); err != nil {
+		return true
+	}
+	const stillActive = 259
+	if exitCode != stillActive {
+		return false
+	}
+	name := make([]uint16, windows.MAX_PATH)
+	size := uint32(len(name))
+	if err := windows.QueryFullProcessImageName(handle, 0, &name[0], &size); err != nil {
+		return true
+	}
+	return strings.Contains(strings.ToLower(filepath.Base(windows.UTF16ToString(name[:size]))), "doubletake")
 }

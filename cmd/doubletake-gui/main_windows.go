@@ -17,6 +17,7 @@ import (
 
 func main() {
 	runtime.LockOSThread()
+	airplay.RestoreInterruptedSpeakerMute()
 
 	appBackend, err := newBackend("127.0.0.1:0")
 	if err != nil {
