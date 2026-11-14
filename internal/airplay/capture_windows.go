@@ -118,29 +118,31 @@ func ffmpegVideoEncoder(cfg CaptureConfig, ffmpegPath string) (args []string, pi
 
 	hwaccel := strings.ToLower(cfg.HWAccel)
 	if hwaccel != "none" && ffmpegHEVCHardwareAvailable(ffmpegPath) {
-		log.Printf("[CAPTURE] using FFmpeg NVENC HEVC Main10 hardware encoding (hevc_nvenc)")
+		log.Printf("[CAPTURE] using FFmpeg NVENC HEVC Main hardware encoding (hevc_nvenc)")
 		return []string{
 			"-c:v", "hevc_nvenc",
 			"-preset", "p4",
 			"-tune", "ull",
 			"-rc", "cbr",
 			"-zerolatency", "1",
-			"-profile:v", "main10",
+			"-profile:v", "main",
 			"-aud", "1",
-			"-repeat_headers", "1",
-		}, "p010le", "hevc", nil
+			// hevc_nvenc has no repeat_headers option; this filter repeats
+			// VPS/SPS/PPS before every keyframe of the Annex B stream.
+			"-bsf:v", "dump_extra=freq=keyframe",
+		}, "yuv420p", "hevc", nil
 	}
 	if hwaccel == "nvenc" {
 		return nil, "", "", fmt.Errorf("the requested FFmpeg hevc_nvenc encoder is unavailable or failed its hardware probe")
 	}
-	log.Printf("[CAPTURE] using FFmpeg software HEVC Main10 encoding (libx265)")
+	log.Printf("[CAPTURE] using FFmpeg software HEVC Main encoding (libx265)")
 	return []string{
 		"-c:v", "libx265",
 		"-preset", "ultrafast",
 		"-tune", "zerolatency",
-		"-profile:v", "main10",
+		"-profile:v", "main",
 		"-x265-params", "repeat-headers=1:aud=1:scenecut=0:bframes=0",
-	}, "yuv420p10le", "hevc", nil
+	}, "yuv420p", "hevc", nil
 }
 
 func ffmpegEncoder(cfg CaptureConfig) []string {
@@ -199,9 +201,11 @@ func ffmpegHEVCHardwareAvailable(ffmpegPath string) bool {
 		defer cancel()
 		cmd := exec.CommandContext(ctx, ffmpegPath,
 			"-hide_banner", "-loglevel", "error",
-			"-f", "lavfi", "-i", "color=size=64x64:rate=1",
+			// NVENC rejects frames below its minimum size (64x64 always
+			// failed), which silently forced every HEVC request onto libx265.
+			"-f", "lavfi", "-i", "color=size=256x256:rate=1",
 			"-frames:v", "1", "-c:v", "hevc_nvenc", "-preset", "p4",
-			"-profile:v", "main10", "-pix_fmt", "p010le", "-f", "null", "-")
+			"-profile:v", "main", "-pix_fmt", "yuv420p", "-f", "null", "-")
 		hideFFmpegWindow(cmd)
 		available = cmd.Run() == nil
 	}
@@ -253,7 +257,20 @@ func (sc *ScreenCapture) ReadVideoAccessUnit() (VideoAccessUnit, error) {
 }
 
 func (sc *ScreenCapture) Stop() {
+	if sc == nil {
+		return
+	}
 	if sc.cmd == nil {
+		// No process to stop, but a reader may still be blocked on the
+		// capture output; closing it releases that read.
+		sc.stopOnce.Do(func() {
+			if sc.cancel != nil {
+				sc.cancel()
+			}
+			if sc.stdout != nil {
+				sc.stdout.Close()
+			}
+		})
 		return
 	}
 	sc.stopOnce.Do(func() {

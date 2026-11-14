@@ -308,7 +308,20 @@ func (sc *ScreenCapture) ReadVideoAccessUnit() (VideoAccessUnit, error) {
 }
 
 func (sc *ScreenCapture) Stop() {
+	if sc == nil {
+		return
+	}
 	if sc.cmd == nil {
+		// No process to stop, but a reader may still be blocked on the
+		// capture output; closing it releases that read.
+		sc.stopOnce.Do(func() {
+			if sc.cancel != nil {
+				sc.cancel()
+			}
+			if sc.stdout != nil {
+				sc.stdout.Close()
+			}
+		})
 		return
 	}
 	sc.stopOnce.Do(func() {

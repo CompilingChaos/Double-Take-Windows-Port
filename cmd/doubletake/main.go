@@ -472,7 +472,10 @@ func main() {
 	}
 
 	if err := session.StreamFrames(ctx, capture, 0*time.Second); err != nil && ctx.Err() == nil {
-		fatalf("streaming error: %v", err)
+		// Return instead of exiting so deferred cleanup runs: capture and
+		// audio stop (restoring the local speakers) and the session tears down.
+		log.Printf("streaming error: %v", err)
+		return
 	}
 	log.Println("stream ended")
 }

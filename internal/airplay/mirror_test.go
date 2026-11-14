@@ -2,6 +2,10 @@ package airplay
 
 import (
 	"bytes"
+	"context"
+	"net"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -174,4 +178,57 @@ func TestGenerateAudioChaChaKeyShortRead(t *testing.T) {
 	if _, err := generateAudioChaChaKey(bytes.NewReader(make([]byte, 8))); err == nil {
 		t.Fatal("expected short reader to fail")
 	}
+}
+
+func TestStreamFramesStopsWhenReceiverClosesDataChannel(t *testing.T) {
+	sender, receiver := net.Pipe()
+	reader := &blockingVideoReader{closed: make(chan struct{}), waitCh: make(chan struct{})}
+	capture := &ScreenCapture{stdout: reader, frames: reader, waitCh: reader.waitCh}
+	session := &MirrorSession{
+		dataConn:       sender,
+		firstFrameSent: make(chan struct{}),
+		streamDone:     make(chan struct{}),
+	}
+	go session.monitorDataConnection(sender)
+
+	result := make(chan error, 1)
+	go func() {
+		result <- session.StreamFrames(context.Background(), capture, 0)
+	}()
+	if err := receiver.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "video data channel closed") {
+			t.Fatalf("StreamFrames error = %v, want receiver disconnect", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("StreamFrames remained blocked after receiver disconnected")
+	}
+	_ = sender.Close()
+}
+
+// blockingVideoReader blocks every read until closed, like a capture process
+// with no new frames.
+type blockingVideoReader struct {
+	closed chan struct{}
+	waitCh chan struct{}
+}
+
+func (r *blockingVideoReader) Read([]byte) (int, error) {
+	<-r.closed
+	return 0, os.ErrClosed
+}
+
+func (r *blockingVideoReader) ReadVideoAccessUnit() (VideoAccessUnit, error) {
+	<-r.closed
+	return VideoAccessUnit{}, os.ErrClosed
+}
+
+func (r *blockingVideoReader) Close() error {
+	close(r.closed)
+	close(r.waitCh)
+	return nil
 }
