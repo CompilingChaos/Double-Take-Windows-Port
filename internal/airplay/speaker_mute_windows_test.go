@@ -40,6 +40,55 @@ func TestRecoverInterruptedSpeakerMutesRetriesUnavailableEndpoint(t *testing.T) 
 	}
 }
 
+func TestRestoreSettlesDeferredStaleSpeakerMute(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "speaker-mute.json")
+	previous := speakerMuteMarkerPath
+	speakerMuteMarkerPath = func() string { return path }
+	t.Cleanup(func() { speakerMuteMarkerPath = previous })
+	stale := speakerMuteMarker{PID: 0, Device: "speakers"}
+	other := speakerMuteMarker{PID: 0, Device: "headphones"}
+	writeSpeakerMuteMarkers([]speakerMuteMarker{stale, other})
+	recordSpeakerMute("speakers")
+
+	// This process holds the endpoint, so recovery defers the stale record.
+	unmuted := map[string]bool{}
+	unmute := func(device string) error {
+		unmuted[device] = true
+		return nil
+	}
+	recoverInterruptedSpeakerMutes(unmute)
+	if unmuted["speakers"] {
+		t.Fatal("recovery unmuted speakers still held by this process")
+	}
+
+	// This process then restores the speakers itself. A later start must not
+	// unmute them again: the user may have muted them on purpose since.
+	clearRestoredSpeakerMute("speakers")
+	clear(unmuted)
+	recoverInterruptedSpeakerMutes(unmute)
+	if unmuted["speakers"] {
+		t.Fatal("a stale record unmuted speakers that were already restored")
+	}
+	if got := readSpeakerMuteMarkers(); len(got) != 0 {
+		t.Fatalf("markers after recovery = %+v, want none", got)
+	}
+}
+
+func TestWithoutRestoredSpeakerMutesKeepsLiveOwners(t *testing.T) {
+	markers := []speakerMuteMarker{
+		{PID: 10, Device: "speakers"},   // this process
+		{PID: 20, Device: "speakers"},   // another running DoubleTake
+		{PID: 30, Device: "speakers"},   // ended
+		{PID: 40, Device: "headphones"}, // ended, other endpoint
+	}
+	running := func(pid int) bool { return pid == 20 }
+	got := withoutRestoredSpeakerMutes(markers, 10, "speakers", running)
+	want := []speakerMuteMarker{{PID: 20, Device: "speakers"}, {PID: 40, Device: "headphones"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("markers = %+v, want %+v", got, want)
+	}
+}
+
 func TestSplitStaleSpeakerMuteMarkersKeepsLiveOwners(t *testing.T) {
 	markers := []speakerMuteMarker{
 		{PID: 10, Device: "speakers"},   // this process

@@ -178,7 +178,7 @@ func restoreLocalSpeakers(device *iMMDevice, id string) {
 		dbg("[AUDIO] restore local speakers: %v", err)
 		return
 	}
-	clearSpeakerMute(id)
+	clearRestoredSpeakerMute(id)
 }
 
 // RestoreInterruptedSpeakerMute unmutes speakers that a DoubleTake process
@@ -341,6 +341,26 @@ func recordSpeakerMute(device string) {
 
 func clearSpeakerMute(device string) {
 	writeSpeakerMuteMarkers(withoutSpeakerMuteMarker(readSpeakerMuteMarkers(), os.Getpid(), device))
+}
+
+// clearRestoredSpeakerMute runs after this process unmuted device. Records of
+// ended processes for the same endpoint are settled by that unmute too; left
+// behind, a later start would unmute speakers the user has since muted.
+func clearRestoredSpeakerMute(device string) {
+	writeSpeakerMuteMarkers(withoutRestoredSpeakerMutes(readSpeakerMuteMarkers(), os.Getpid(), device, doubleTakeProcessRunning))
+}
+
+// withoutRestoredSpeakerMutes drops device's records owned by self or by a
+// process that is no longer running. Another live owner's record is kept.
+func withoutRestoredSpeakerMutes(markers []speakerMuteMarker, self int, device string, running func(int) bool) []speakerMuteMarker {
+	kept := markers[:0:0]
+	for _, marker := range markers {
+		if marker.Device == device && (marker.PID == self || !running(marker.PID)) {
+			continue
+		}
+		kept = append(kept, marker)
+	}
+	return kept
 }
 
 func withoutSpeakerMuteMarker(markers []speakerMuteMarker, pid int, device string) []speakerMuteMarker {
