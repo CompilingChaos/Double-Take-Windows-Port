@@ -64,6 +64,7 @@ func main() {
 	credFile := flag.String("creds", airplay.DefaultCredentialsPath(), "Path to saved pairing credentials")
 	credBackend := flag.String("cred-backend", "file", "Credential storage backend: file or keyring (system keyring)")
 	forcePair := flag.Bool("pair", false, "Force new pairing even if credentials exist")
+	expectedDeviceID := flag.String("device-id", "", "Device ID of the receiver meant, e.g. from discovery. Its saved pairing applies even if the device at -target names itself differently, and such a device is refused")
 	fps := flag.Int("fps", 30, "Frames per second")
 	bitrate := flag.Int("bitrate", 0, "Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)")
 	targetLatencyMs := flag.Int("target-latency-ms", 0, "Joint audio/video playout latency override in milliseconds (0 = automatic AirPlay policy)")
@@ -207,10 +208,22 @@ func main() {
 		fatalf("failed to load credentials: %v", err)
 	}
 
-	var savedCreds *airplay.SavedCredentials
-	if !needFullPair {
-		savedCreds = credStore.Lookup(info.DeviceID)
+	// Looked up even for -pair: a receiver this machine has paired with is
+	// paired with again only with a code, never transiently.
+	// The receiver meant: as given, or as discovery advertised it when it was
+	// picked. Without either, the device at -target is taken at its word.
+	expectedID := *expectedDeviceID
+	if expectedID == "" && advertisement != nil {
+		expectedID = advertisement.DeviceID
 	}
+	if expectedID == "" {
+		log.Printf("warning: no -device-id; a device at %s naming itself as a new receiver would be paired with from scratch", addr)
+	}
+	savedCreds, err := credStore.LookupReceiver(expectedID, info.DeviceID)
+	if err != nil {
+		fatalf("%v; refusing to cast", err)
+	}
+	pairedWithCode := savedCreds.HasPairingCredentials() && !savedCreds.UsesRawPairing()
 
 	reconnect := func() {
 		_ = client.Close()
@@ -220,26 +233,51 @@ func main() {
 			fatalf("reconnect failed: %v", err)
 		}
 		var err error
+		previousID := info.DeviceID
 		info, err = client.GetInfo()
 		if err != nil {
 			fatalf("get info after reconnect failed: %v", err)
 		}
+		// Whatever is paired with next is saved under this ID, so the device
+		// may not change it between connections.
+		if !strings.EqualFold(info.DeviceID, previousID) {
+			log.Fatalf("the receiver named itself %q, then %q after reconnecting; refusing to cast",
+				previousID, info.DeviceID)
+		}
 	}
 
+	var pairWithCredential func(value string, expectPIN bool)
 	savePairingCredentials := func() {
-		if client.PairKeys == nil {
+		// Only a pairing that proved the receiver's identity is worth saving:
+		// without that identity a later pair-verify has nothing to check the
+		// receiver against.
+		receiver := client.ReceiverIdentity()
+		if client.PairKeys == nil || receiver == nil {
 			return
 		}
 		if err := credStore.SavePairing(info.DeviceID, client.PairingID,
 			client.PairKeys.Ed25519Public, client.PairKeys.Ed25519Private,
-			client.PairingProtocol()); err != nil {
+			client.PairingProtocol(), receiver); err != nil {
 			log.Printf("warning: failed to save credentials: %v", err)
 		} else {
 			log.Printf("credentials saved (%s)", *credBackend)
 		}
 	}
-
-	pairWithCredential := func(value string, expectPIN bool) {
+	pairFresh := func() {
+		if passwordRequiresPairing(info) {
+			pairWithCredential("", false)
+		} else if info.RequiredPairingCredential() == airplay.PairingCredentialPIN {
+			pairWithCredential("", true)
+		} else if err := client.Pair(ctx, ""); err != nil {
+			if info.RequiresPassword() {
+				fatalf("transient pairing failed for password-protected receiver: %v", err)
+			}
+			log.Printf("transient pairing failed: %v, requesting pairing credentials", err)
+			reconnect()
+			pairWithCredential("", false)
+		}
+	}
+	pairWithCredential = func(value string, expectPIN bool) {
 		if value == "" {
 			value = credentialOrPrompt("", client, info, expectPIN)
 		}
@@ -250,8 +288,33 @@ func main() {
 		}
 		savePairingCredentials()
 	}
-
-	if needFullPair {
+	// pairAgainWithCode pairs again with a receiver this machine has paired
+	// with before. It goes through PairWithCode, which never falls back to
+	// transient pairing whatever /info claims: only the real receiver can show
+	// its PIN on its own screen.
+	pairAgainWithCode := func() {
+		var code string
+		if passwordRequiresPairing(info) {
+			// A legacy receiver's configured pairing password.
+			code = credential
+			if code == "" {
+				code = readCredential(bufio.NewReader(os.Stdin), "Enter the receiver's pairing password: ")
+			}
+			credential = code
+			client.SetPassword(code)
+		} else {
+			// A PIN is shown afresh each time, so a preset -code cannot be it:
+			// show one and ask for it.
+			code = credentialOrPrompt("", client, info, true)
+		}
+		if err := client.PairWithCode(ctx, code); err != nil {
+			fatalf("pairing failed: %v", err)
+		}
+		savePairingCredentials()
+	}
+	if needFullPair && pairedWithCode {
+		pairAgainWithCode()
+	} else if needFullPair {
 		if forcePairUsesTransient(info) {
 			if err := client.Pair(ctx, ""); err != nil {
 				fatalf("transient pairing failed for password-protected receiver: %v", err)
@@ -259,36 +322,44 @@ func main() {
 		} else {
 			pairWithCredential(credential, !info.RequiresPassword())
 		}
-	} else if savedCreds != nil && savedCreds.HasPairingCredentials() {
-		// Use saved credentials — pair-verify
+	} else if savedCreds.HasPairingCredentials() {
+		// Once this machine has paired with a receiver, nothing falls back to
+		// transient pairing for it; airplay.AfterSavedPairing says why.
 		log.Printf("using saved credentials (%s)", *credBackend)
-		verifyErr := restoreSavedPairing(client, savedCreds)
-		if verifyErr == nil {
-			verifyErr = client.PairVerify(ctx)
+		var verifyErr error
+		step := airplay.AfterSavedPairing(savedCreds, func() error {
+			verifyErr = restoreSavedPairing(client, savedCreds)
+			if verifyErr == nil {
+				verifyErr = client.PairVerify(ctx)
+			}
+			return verifyErr
+		})
+		if step == airplay.SavedPairingRefuse {
+			if errors.Is(verifyErr, airplay.ErrReceiverNotAuthenticated) {
+				fatalf("%v; refusing to cast. The device answering as %q is not the receiver "+
+					"this machine paired with, or will not prove it. If you reset or replaced that "+
+					"receiver, run again with -pair and enter the code it shows; a receiver that "+
+					"shows no code is not the one you paired with.", verifyErr, info.Name)
+			}
+			fatalf("pair-verify with saved creds failed: %v; refusing to replace the saved "+
+				"pairing with an unauthenticated one. If you reset or replaced that receiver, "+
+				"remove its entry from %s and connect again.", verifyErr, *credFile)
 		}
-		if verifyErr != nil {
-			log.Printf("pair-verify with saved creds failed: %v", verifyErr)
-			reconnect()
-			if passwordRequiresPairing(info) {
-				pairWithCredential("", false)
-			} else if info.RequiredPairingCredential() == airplay.PairingCredentialPIN {
-				pairWithCredential("", true)
-			} else if err := client.Pair(ctx, ""); err != nil {
-				log.Printf("transient pairing fallback failed: %v", err)
+		if step != airplay.SavedPairingVerified {
+			if verifyErr != nil {
+				log.Printf("pair-verify with saved creds failed: %v", verifyErr)
 				reconnect()
-				pairWithCredential("", false)
+			} else {
+				log.Printf("saved credentials predate receiver authentication; pairing again")
+			}
+			if step == airplay.SavedPairingPairAsNew {
+				pairFresh()
+			} else {
+				pairAgainWithCode()
 			}
 		}
 	} else {
-		if passwordRequiresPairing(info) {
-			pairWithCredential("", false)
-		} else if info.RequiredPairingCredential() == airplay.PairingCredentialPIN {
-			pairWithCredential("", true)
-		} else if err := client.Pair(ctx, ""); err != nil {
-			log.Printf("transient pairing failed: %v", err)
-			reconnect()
-			pairWithCredential("", false)
-		}
+		pairFresh()
 	}
 	log.Println("pairing complete")
 
