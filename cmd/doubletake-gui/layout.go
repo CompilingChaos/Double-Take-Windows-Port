@@ -49,7 +49,8 @@ func (d *desktop) layout(gtx layout.Context) {
 	if d.pending != nil {
 		d.pairingDialog(gtx, w, h, *d.pending)
 	}
-	d.toastStack(gtx, w, h)
+	// Error pop-ups sit in the bottom-right corner; brief notices stack above.
+	d.toastStack(gtx, w, d.errorStack(gtx, w, h))
 }
 
 func (d *desktop) topbar(gtx layout.Context, w int) {
@@ -233,9 +234,6 @@ func (d *desktop) mainPanel(gtx layout.Context, sidebar, w, h, padding int) {
 		ctx.Constraints = layout.Exact(image.Pt(dp(gtx, width), dp(gtx, max(0, h-76-2*padding))))
 		defer clip.Rect(image.Rectangle{Max: ctx.Constraints.Max}).Push(gtx.Ops).Pop()
 		if len(d.state.Status.Streams) == 0 {
-			if d.state.SystemMessage != "" {
-				d.systemError(ctx, width)
-			}
 			d.welcome(ctx, width, max(0, h-76-2*padding))
 			return
 		}

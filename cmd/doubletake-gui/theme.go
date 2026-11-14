@@ -257,6 +257,9 @@ var glyphStrokes = map[string][][]f32.Point{
 	"mute":       {{{X: 4, Y: 9}, {X: 4, Y: 15}, {X: 8, Y: 15}, {X: 13, Y: 19}, {X: 13, Y: 5}, {X: 8, Y: 9}, {X: 4, Y: 9}}, {{X: 17, Y: 9}, {X: 22, Y: 15}}, {{X: 22, Y: 9}, {X: 17, Y: 15}}},
 	"sound":      {{{X: 4, Y: 9}, {X: 4, Y: 15}, {X: 8, Y: 15}, {X: 13, Y: 19}, {X: 13, Y: 5}, {X: 8, Y: 9}, {X: 4, Y: 9}}, {{X: 17, Y: 9}, {X: 18.5, Y: 12}, {X: 17, Y: 15}}, {{X: 19.5, Y: 6}, {X: 21.5, Y: 9}, {X: 22, Y: 12}, {X: 21.5, Y: 15}, {X: 19.5, Y: 18}}},
 	"lock":       {{{X: 8, Y: 10}, {X: 8, Y: 7}, {X: 9, Y: 4.5}, {X: 12, Y: 3}, {X: 15, Y: 4.5}, {X: 16, Y: 7}, {X: 16, Y: 10}}, {{X: 12, Y: 14}, {X: 12, Y: 17}}},
+	"alert":      {{{X: 12, Y: 6.5}, {X: 12, Y: 13.5}}, {{X: 12, Y: 17}, {X: 12, Y: 17.6}}},
+	"check":      {{{X: 5, Y: 12.5}, {X: 10, Y: 17.5}, {X: 19, Y: 7}}},
+	"copy":       {{{X: 5, Y: 15}, {X: 4, Y: 15}, {X: 4, Y: 4}, {X: 15, Y: 4}, {X: 15, Y: 5}}},
 }
 
 func glyph(gtx layout.Context, bounds image.Rectangle, name string, fg color.NRGBA) {
@@ -274,6 +277,8 @@ func glyph(gtx layout.Context, bounds image.Rectangle, name string, fg color.NRG
 		rounded(image.Rect(4, 4, 18, 18), 7)
 	case "lock":
 		rounded(image.Rect(4, 10, 20, 21), 3)
+	case "copy":
+		rounded(image.Rect(9, 9, 20, 20), 2)
 	}
 	var path clip.Path
 	path.Begin(gtx.Ops)

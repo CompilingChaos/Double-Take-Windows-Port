@@ -48,9 +48,13 @@ type desktop struct {
 	pending                     *daemon.StreamInfo
 	focusCredential             bool
 	toasts                      []toast
-	lastError                   string
-	results                     chan commandResult
-	busy                        map[string]bool
+	errors                      []*errorPopup
+	// lastErrorID and lastSystemMessage are the daemon error and startup
+	// problem already shown, so each one pops up once.
+	lastErrorID       uint64
+	lastSystemMessage string
+	results           chan commandResult
+	busy              map[string]bool
 	// frameInterval is the redraw rate the animations drawn in the current
 	// frame need; zero when the frame is static.
 	frameInterval time.Duration
@@ -99,9 +103,9 @@ func receiverKey(device daemon.DeviceInfo) deviceKey {
 	return deviceKey{ip: device.IP, id: device.DeviceID, port: device.Port}
 }
 
+// toast is a brief notice that disappears by itself. Errors use errorPopup.
 type toast struct {
 	message string
-	isError bool
 	expires time.Time
 }
 
@@ -154,9 +158,13 @@ func (d *desktop) poll(now time.Time) {
 		}
 	}
 	activeStreams := make(map[string]bool, len(d.state.Status.Streams))
-	if d.state.Status.Error != d.lastError {
-		d.notify(now, d.state.Status.Error, true)
-		d.lastError = d.state.Status.Error
+	if id := d.state.Status.ErrorID; id != 0 && id != d.lastErrorID {
+		d.raiseError(now, d.state.Status.Error)
+	}
+	d.lastErrorID = d.state.Status.ErrorID
+	if message := d.state.SystemMessage; message != d.lastSystemMessage {
+		d.raiseError(now, message)
+		d.lastSystemMessage = message
 	}
 	d.pending = nil
 	for i := range d.state.Status.Streams {
@@ -181,8 +189,12 @@ func (d *desktop) poll(now time.Time) {
 }
 
 func (d *desktop) notify(now time.Time, message string, isError bool) {
+	if isError {
+		d.raiseError(now, message)
+		return
+	}
 	if message != "" {
-		d.toasts = append(d.toasts, toast{message: message, isError: isError, expires: now.Add(3900 * time.Millisecond)})
+		d.toasts = append(d.toasts, toast{message: message, expires: now.Add(3900 * time.Millisecond)})
 	}
 }
 
@@ -210,6 +222,7 @@ func (d *desktop) command(target, message string, run func() daemon.Response) {
 }
 
 func (d *desktop) update(gtx layout.Context) {
+	d.updateErrors(gtx)
 	for len(d.results) > 0 {
 		result := <-d.results
 		delete(d.busy, result.target)

@@ -18,10 +18,6 @@ import (
 
 func (d *desktop) sessionHeader(gtx layout.Context, w int) layout.Dimensions {
 	y := 0
-	if d.state.SystemMessage != "" {
-		d.systemError(gtx, w)
-		y += 67
-	}
 	d.label(gtx, rect(gtx, 0, y, w, 17), layout.W, 11, font.Bold, blue,
 		d.tr("N O W  P L A Y I N G", "A K T U E L L E  Ü B E R T R A G U N G"))
 	d.label(gtx, rect(gtx, 0, y+17, w, 36), layout.W, 28, font.Bold, ink,
@@ -47,11 +43,6 @@ func (d *desktop) sessionHeader(gtx layout.Context, w int) layout.Dimensions {
 		y += 67
 	}
 	return layout.Dimensions{Size: image.Pt(dp(gtx, w), dp(gtx, y))}
-}
-
-func (d *desktop) systemError(gtx layout.Context, width int) {
-	box(gtx, rect(gtx, 0, 0, width, 50), 14, rgba(0x6c1a2e, 33), rgba(0xff5c7a, 56))
-	d.label(gtx, rect(gtx, 16, 0, max(0, width-32), 50), layout.W, 12, font.Normal, rgb(0xff9eb0), d.state.SystemMessage)
 }
 
 func (d *desktop) sessionCard(gtx layout.Context, w int, s daemon.StreamInfo) layout.Dimensions {
@@ -194,8 +185,10 @@ func (d *desktop) pairingDialog(gtx layout.Context, w, h int, pending daemon.Str
 	d.button(gtx, rect(gtx, x+37+half, y+237, width-64-half, 48), &d.submit, 14, rgb(0x276fe5), rgb(0x3da8ff), color.NRGBA{}, ink, d.tr("Continue", "Weiter"), "", 13)
 }
 
-func (d *desktop) toastStack(gtx layout.Context, w, h int) {
-	y := h - 21
+// toastStack draws brief notices upwards from bottom (dp). Errors are shown
+// as pop-ups instead; see errorStack.
+func (d *desktop) toastStack(gtx layout.Context, w, bottom int) {
+	y := bottom
 	width := min(360, w-42)
 	current := d.toasts[:0]
 	for _, t := range d.toasts {
@@ -207,9 +200,6 @@ func (d *desktop) toastStack(gtx layout.Context, w, h int) {
 	for i := len(d.toasts) - 1; i >= 0; i-- {
 		t := d.toasts[i]
 		border, tint := rgba(0x72a4e5, 46), rgb(0xdbeaff)
-		if t.isError {
-			border, tint = rgba(0xff5c7a, 64), rgb(0xffafbd)
-		}
 		y -= 47
 		x := w - 21 - width
 		box(gtx, rect(gtx, x, y, width, 47), 14, rgba(0x0d1a2c, 245), border)
