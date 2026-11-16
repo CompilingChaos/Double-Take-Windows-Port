@@ -391,6 +391,20 @@ func TestSetupMirrorWithAudioSetsReceiverVolume(t *testing.T) {
 	}
 }
 
+// Apple receivers start processing real-time audio only once RECORD has
+// prepared the session, so a control-first session records before creating
+// its audio stream. A receiver that requires streams first answers 455 and
+// is recorded after stream setup instead.
+func TestSetupMirrorPreparesAudioBeforeStreamSetup(t *testing.T) {
+	for _, rejectEarly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rejectEarly=%t", rejectEarly), func(t *testing.T) {
+			testSetupMirrorAudioSessionNegotiation(t, audioSessionCase{
+				controlFirst: true, rejectEarlyRecord: rejectEarly,
+			})
+		})
+	}
+}
+
 func TestSetupMirrorControlFirstRecordsAfterStreamSetup(t *testing.T) {
 	testSetupMirrorAudioSessionNegotiation(t, audioSessionCase{
 		skipRecord:   false,
@@ -418,9 +432,10 @@ func TestSetAudioMutedRefusesWhenSessionHasNoAudio(t *testing.T) {
 }
 
 type audioSessionCase struct {
-	skipRecord   bool
-	noAudio      bool
-	controlFirst bool
+	rejectEarlyRecord bool
+	skipRecord        bool
+	noAudio           bool
+	controlFirst      bool
 }
 
 func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase) {
@@ -503,6 +518,7 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 		reader := bufio.NewReader(conn)
 		timingPort := 0
 		controlSetups := 0
+		audioPrepared := false
 		for {
 			req, err := readRTSPTestRequest(reader)
 			if err != nil {
@@ -600,6 +616,7 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 				var respBody []byte
 				switch streamType {
 				case 96:
+					audioPrepared = true
 					if test.controlFirst {
 						if len(setup) != 1 {
 							serverErr <- fmt.Errorf("control-first audio SETUP keys = %#v, want only streams", setup)
@@ -697,6 +714,13 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 					}
 				}
 			case "RECORD":
+				if test.rejectEarlyRecord && !audioPrepared {
+					if err := writeRTSPTestResponse(conn, 455, nil, nil); err != nil {
+						serverErr <- err
+						return
+					}
+					continue
+				}
 				if err := writeRTSPTestResponse(conn, 200, map[string]string{
 					"Audio-Latency": "11025",
 				}, nil); err != nil {
@@ -789,9 +813,17 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 		t.Fatalf("Close: %v", err)
 	}
 
-	wantMethods := []string{"SETUP", "SETUP", "SETUP"}
+	wantMethods := []string{"SETUP"}
+	earlyRecord := test.controlFirst && !noAudio && !skipRecord
 	recordIndex := -1
-	if !skipRecord {
+	if earlyRecord {
+		recordIndex = len(wantMethods)
+		wantMethods = append(wantMethods, "RECORD")
+	}
+	audioIndex := len(wantMethods)
+	videoIndex := audioIndex + 1
+	wantMethods = append(wantMethods, "SETUP", "SETUP")
+	if !skipRecord && (!earlyRecord || test.rejectEarlyRecord) {
 		recordIndex = len(wantMethods)
 		wantMethods = append(wantMethods, "RECORD")
 	}
@@ -816,8 +848,6 @@ func testSetupMirrorAudioSessionNegotiation(t *testing.T, test audioSessionCase)
 			t.Fatalf("request %d = %s, want %s", index, got[index].method, want)
 		}
 	}
-	const audioIndex = 1
-	const videoIndex = 2
 	if got[0].uri != got[audioIndex].uri {
 		t.Fatal("control-first probe should use the audio session URI")
 	}

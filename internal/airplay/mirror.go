@@ -577,6 +577,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		return nil
 	}
 	skipRecord := false
+	recorded := false
 
 	firstSetup := true
 	sendSetup := func(uri, phase string, request map[string]interface{}) (map[string]interface{}, map[string]string, time.Time, error) {
@@ -620,6 +621,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 				dbg("[SETUP] receiver Audio-Latency telemetry: %d samples (%v)", parsed, receiverLatency)
 			}
 		}
+		recorded = true
 		return nil
 	}
 
@@ -787,6 +789,19 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		observeEventPort(controlResp)
 		if err := connectEvent(); err != nil {
 			return nil, err
+		}
+		// Apple's real-time audio SETUP starts packet processing only after
+		// RECORD has prepared the media session. A control-first session can do
+		// that before creating its audio stream. Peers requiring streams first
+		// explicitly reject this state with 455; retain their late-RECORD path.
+		if !cfg.NoAudio && !skipRecord {
+			if err := recordSession(); err != nil {
+				var statusErr *HTTPStatusError
+				if !errors.As(err, &statusErr) || statusErr.StatusCode != 455 {
+					return nil, err
+				}
+				dbg("[SETUP] receiver requires stream SETUP before RECORD; deferring media preparation")
+			}
 		}
 		if skipRecord {
 			dbg("[SETUP] receiver returned skipRecord=true; RECORD will be skipped after stream setup")
@@ -1001,14 +1016,16 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	}
 	dbg("[SETUP] data channel connected: %s (TCP_NODELAY, sndbuf=64K)", dataAddr)
 
-	// The sender activates the session in its second start stage, after every
+	// Legacy media-first sessions, sessions without audio and peers which
+	// rejected the early RECORD still need activation here, after every
 	// transport stream has been set up. A receiver may waive that final RECORD
-	// request with skipRecord, but accepting the control SETUP alone does not
-	// make it safe to activate an otherwise incomplete session.
+	// with skipRecord. A successful early RECORD must not be repeated.
 	if skipRecord {
 		dbg("[SETUP] receiver returned skipRecord=true; session was started by SETUP")
-	} else if err := recordSession(); err != nil {
-		return nil, err
+	} else if !recorded {
+		if err := recordSession(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Only set the receiver's volume when this session actually carries audio.
