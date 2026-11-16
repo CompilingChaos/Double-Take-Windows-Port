@@ -1,6 +1,6 @@
 module doubletake
 
-go 1.25.0
+go 1.27.4
 
 require (
 	gioui.org v0.9.0

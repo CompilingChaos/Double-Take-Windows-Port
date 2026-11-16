@@ -36,7 +36,7 @@ Choose the screen to share when the desktop prompts you. On X11, DoubleTake
 captures the primary screen. Audio capture uses the monitor of your default
 PulseAudio or PipeWire-Pulse output, and local playback continues while streaming.
 
-To install from source for your user, install Go 1.25+ and run:
+To install from source for your user, install Go 1.27+ and run:
 
 ```sh
 sudo apt install build-essential pkg-config libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
@@ -59,7 +59,7 @@ winget install --id Gyan.FFmpeg --exact
 Extract the Windows release files to the same folder and open `doubletake.exe`.
 Run `.\doubletake-cli.exe` to use receiver discovery from PowerShell.
 
-To build from source, install Go 1.25 or newer and run `.\build.ps1` in
+To build from source, install Go 1.27 or newer and run `.\build.ps1` in
 PowerShell. The app, CLI, control tool, and diagnostic receiver are built in
 `bin\`.
 
