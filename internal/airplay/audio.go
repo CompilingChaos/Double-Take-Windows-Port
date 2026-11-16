@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -119,14 +118,6 @@ func audioLatencySamplesForCodec(ct byte, override uint32) uint32 {
 	}
 	_ = ct
 	return targetLatencySamples44k1()
-}
-
-func randomRTPTime(reader io.Reader) (uint32, error) {
-	var value [4]byte
-	if _, err := io.ReadFull(reader, value[:]); err != nil {
-		return 0, fmt.Errorf("generate RTP timestamp: %w", err)
-	}
-	return binary.BigEndian.Uint32(value[:]), nil
 }
 
 // AudioCapture manages platform audio capture and local encoding.
@@ -1371,18 +1362,6 @@ func (s *MirrorSession) StreamAudio(ctx context.Context, capture *AudioCapture, 
 
 videoReady:
 
-	// Apple starts each audio timeline at a random 32-bit RTP epoch. The
-	// latency-adjusted TimeAnnounce value is allowed to wrap below that epoch.
-	// No empty header packet is sent before the first real audio frame.
-	nextRtp, err := randomRTPTime(rand.Reader)
-	if err != nil {
-		return err
-	}
-	// Update rtpTime so the first sync packet reflects the first media position.
-	audioStream.mu.Lock()
-	audioStream.rtpTime = nextRtp
-	audioStream.mu.Unlock()
-
 	// Discard any partial unframed pipe backlog between the final prewarm read and
 	// the video-ready signal, then wait until one complete, fresh audio frame is in hand.
 	// The RTP/network-clock mapping must be established at this point, not when
@@ -1393,6 +1372,7 @@ videoReady:
 	frameBuf := make([]byte, 8192)
 	firstFrameSize := 0
 	var firstFramePosition audioPCMFramePosition
+	var err error
 	catchupFrames := 0
 	for firstFrameSize == 0 {
 		firstFrameSize, firstFramePosition, err = capture.readFramePosition(frameBuf)
@@ -1428,8 +1408,16 @@ videoReady:
 		// Transparent raw fallback: preserve the historical read-time anchor.
 		firstFramePosition.PTS = time.Now()
 	}
-	rtpClock := newAudioRTPClock(nextRtp)
+	// Keep one sample timeline for data and TimeAnnounce. RECORD announces
+	// seq=0;rtptime=0 and the first packet has sequence 1, so its RTP time is
+	// one codec frame after that origin. Apple's receiver infers samples per
+	// packet from this first step; a random epoch would contradict RECORD and
+	// look like an enormous codec frame.
+	rtpClock := newAudioRTPClock(uint32(spf))
 	firstFrameRTP, _ := rtpClock.mapFramePosition(firstFramePosition, spf)
+	audioStream.mu.Lock()
+	audioStream.rtpTime = firstFrameRTP
+	audioStream.mu.Unlock()
 	var announceMu sync.Mutex
 
 	// Establish the initial mapping at the first sample's source PTS. The reset
