@@ -93,11 +93,11 @@ func compatibilityForReceiver(info *ReceiverInfo, encrypted, audioEnabled bool) 
 
 	// The sender gates PTP on both feature 41 and SourceVersion 354.54.6. PTP is
 	// meaningful here only after pair-verify actually encrypted the control
-	// channel. SourceVersion 377.40.x is a narrowly observed interoperability
-	// exception whose feature 41 advertisement does not yield a working PTP
-	// mirroring session.
+	// channel. Receivers which advertise PTP but decline it during SETUP are
+	// handled from that protocol response rather than by model or version rules.
 	// macOS 26.6.2 accepts a PTP video session but presents only its first
-	// picture. Its NTP path presents the continuing frame stream.
+	// picture, so no SETUP failure reveals it. Its NTP path presents the
+	// continuing frame stream.
 	if encrypted && info.HasFeature(featurePTP) && supportsPTPSourceVersion(info.SourceVersion) && !isMacReceiver(info) {
 		policy.timing = timingProtocolPTP
 	}
@@ -130,7 +130,7 @@ func screenAudioCodec(info *ReceiverInfo, allowAACELD bool) (AudioCodec, error) 
 
 func supportsPTPSourceVersion(sourceVersion string) bool {
 	major, minor, patch, ok := parseSourceVersion(sourceVersion)
-	if !ok || major == 377 && minor == 40 {
+	if !ok {
 		return false
 	}
 	return compareVersion(

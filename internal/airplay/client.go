@@ -334,6 +334,9 @@ type AirPlayClient struct {
 	// transient pairing is unauthenticated by design, and there is nothing
 	// long-term to verify. A pair-verify with neither is refused.
 	transientSetup bool
+	// A transient HAP identity is scoped to its original control connection.
+	pairedTransient bool
+	ntpFallback     bool // live PTP negotiation failed on this client
 
 	// Encryption state after pair-verify
 	encrypted     bool
@@ -512,6 +515,56 @@ func (c *AirPlayClient) sessionPeerHost() string {
 func (c *AirPlayClient) Close() error {
 	if c.conn != nil {
 		return c.conn.Close()
+	}
+	return nil
+}
+
+// reconnectMirrorControl replaces a torn-down session's control transport.
+// Pair-verify keys, framing counters, media keys, and FairPlay SAP state all
+// belong to the old connection and must be established again before SETUP.
+func (c *AirPlayClient) reconnectMirrorControl(ctx context.Context) (err error) {
+	redoTransient := c.pairedTransient
+	hadFairPlay := c.fpKey != nil
+	previousID := ""
+	if c.info != nil {
+		previousID = c.info.DeviceID
+	}
+	_ = c.Close()
+	c.encrypted = false
+	c.encWriteKey, c.encReadKey, c.encCipher = nil, nil, nil
+	c.encWriteNonce, c.encReadNonce = 0, 0
+	c.streamKey, c.streamIV = nil, nil
+	c.fpKey, c.fpIV, c.FpEkey, c.fpM3, c.fpAesKey = nil, nil, nil, nil, nil
+	c.authChallenge = nil
+	c.transientSetup = false
+	if err = c.Connect(ctx); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = c.Close()
+		}
+	}()
+	info, err := c.GetInfo()
+	if err != nil {
+		return fmt.Errorf("refresh receiver info: %w", err)
+	}
+	if !strings.EqualFold(previousID, info.DeviceID) {
+		return fmt.Errorf("%w: receiver changed device ID from %q to %q during timing fallback",
+			ErrReceiverNotAuthenticated, previousID, info.DeviceID)
+	}
+	if redoTransient {
+		err = c.pairTransient(ctx)
+	} else {
+		err = c.PairVerify(ctx)
+	}
+	if err != nil {
+		return fmt.Errorf("authenticate replacement control connection: %w", err)
+	}
+	if hadFairPlay {
+		if err = c.FairPlaySetup(ctx); err != nil {
+			return fmt.Errorf("renew FairPlay session: %w", err)
+		}
 	}
 	return nil
 }
@@ -976,6 +1029,12 @@ func (c *AirPlayClient) rtspRequest(method, uri, contentType string, body []byte
 }
 
 func (c *AirPlayClient) rtspRequestOnce(method, uri, contentType string, body []byte, extraHeaders map[string]string) ([]byte, map[string]string, error) {
+	return c.rtspRequestOnceWithTimeout(method, uri, contentType, body, extraHeaders, 0)
+}
+
+// rtspRequestOnceWithTimeout is rtspRequestOnce with a bound on the wait for
+// the response; zero keeps the default.
+func (c *AirPlayClient) rtspRequestOnceWithTimeout(method, uri, contentType string, body []byte, extraHeaders map[string]string, timeout time.Duration) ([]byte, map[string]string, error) {
 	seq := c.cseq.Add(1)
 
 	var buf bytes.Buffer
@@ -1007,7 +1066,7 @@ func (c *AirPlayClient) rtspRequestOnce(method, uri, contentType string, body []
 	}
 	dbg("[RTSP] wrote %d bytes to socket, waiting for response...", len(data))
 
-	respBody, respHeaders, err := c.readHTTPResponse()
+	respBody, respHeaders, err := c.readHTTPResponseWithTimeout(timeout)
 	if err != nil {
 		// Return the headers even on failure: a 401 carries its
 		// WWW-Authenticate challenge there, and dropping them makes an

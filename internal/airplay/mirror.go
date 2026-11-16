@@ -34,7 +34,14 @@ const (
 
 	legacyAirPlaySourceVersion = "280.33"
 	modernAirPlaySourceVersion = "980.71.1"
+
+	asyncPTPClockWaitTimeout = 2 * time.Second
+	// failedMirrorSetupTeardownTimeout bounds the cleanup of a failed setup, so
+	// it cannot turn a startup error into another 30-second wait.
+	failedMirrorSetupTeardownTimeout = 2 * time.Second
 )
+
+var errPTPClockUnavailable = errors.New("receiver did not establish a PTP clock")
 
 // mediaClock maps local monotonic time onto the receiver's PTP timeline. The
 // receiver's X-Apple-RequestReceivedTimestamp is in the same boot-relative
@@ -44,13 +51,15 @@ type mediaClock struct {
 	anchorLocal     time.Time
 	anchorTimestamp uint64
 	timelineID      uint64
+	ready           chan struct{}
+	readyClosed     bool
 }
 
 func (c *mediaClock) configureFromSetup(response map[string]interface{}, headers map[string]string, receivedAt time.Time) error {
 	peer, _ := response["timingPeerInfo"].(map[string]interface{})
 	timelineID := plistUint64(peer["ClockID"])
 	if timelineID == 0 {
-		return fmt.Errorf("SETUP response omitted timingPeerInfo.ClockID")
+		return fmt.Errorf("%w: SETUP response omitted timingPeerInfo.ClockID", errPTPClockUnavailable)
 	}
 
 	anchorTimestamp, receivedMillis, processingMillis, err := receiverClockTimestamp(headers)
@@ -68,6 +77,7 @@ func (c *mediaClock) configureFromSetup(response map[string]interface{}, headers
 	c.timelineID = timelineID
 	c.anchorLocal = receivedAt
 	c.anchorTimestamp = anchorTimestamp
+	c.signalReadyLocked()
 	c.mu.Unlock()
 	dbg("[PTP] receiver clock: timeline=0x%016x anchor=%dms processing=%dms",
 		timelineID, receivedMillis, processingMillis)
@@ -89,7 +99,42 @@ func (c *mediaClock) configureFromLocalClock() error {
 	}
 	c.anchorLocal = anchorLocal
 	c.anchorTimestamp = anchorTimestamp
+	c.signalReadyLocked()
 	return nil
+}
+
+func (c *mediaClock) signalReadyLocked() {
+	if c.anchorLocal.IsZero() || c.timelineID == 0 || c.readyClosed {
+		return
+	}
+	if c.ready == nil {
+		c.ready = make(chan struct{})
+	}
+	close(c.ready)
+	c.readyClosed = true
+}
+
+func (c *mediaClock) readySignal() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ready == nil {
+		c.ready = make(chan struct{})
+	}
+	c.signalReadyLocked()
+	return c.ready
+}
+
+func (c *mediaClock) waitUntilReady(ctx context.Context, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-c.readySignal():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("%w: asynchronous timing peer update did not arrive within %v", errPTPClockUnavailable, timeout)
+	}
 }
 
 func (c *mediaClock) identity() uint64 {
@@ -139,21 +184,36 @@ func (c *mediaClock) reanchor(headers map[string]string, receivedAt time.Time) e
 
 // updateTimingPeerInfo switches to a newly advertised PTP timeline without
 // introducing a timestamp discontinuity. Event-channel timing updates contain
-// only peer metadata (not a receiver timestamp), so carry the current estimate
-// forward to the instant the command was received and update both atomically.
+// only peer metadata (not a receiver timestamp), so carry an existing estimate
+// forward or establish the initial mapping from local boot time.
 func (c *mediaClock) updateTimingPeerInfo(peer map[string]interface{}, receivedAt time.Time) error {
 	timelineID := plistUint64(peer["ClockID"])
 	if timelineID == 0 {
 		return fmt.Errorf("updateTimingPeerInfo omitted ClockID")
 	}
 
+	localNow := time.Now()
+	localTimestamp := compactTimestamp(bootRelativeNow())
+	if receivedAt.IsZero() {
+		receivedAt = localNow
+	}
+
 	c.mu.Lock()
 	previousTimeline := c.timelineID
-	if !c.anchorLocal.IsZero() && !receivedAt.Before(c.anchorLocal) {
+	if c.anchorLocal.IsZero() {
+		c.anchorLocal = receivedAt
+		if timestamp, ok := addTimestampDuration(localTimestamp, receivedAt.Sub(localNow)); ok {
+			c.anchorTimestamp = timestamp
+		} else {
+			c.anchorLocal = localNow
+			c.anchorTimestamp = localTimestamp
+		}
+	} else if !receivedAt.Before(c.anchorLocal) {
 		c.anchorTimestamp += compactTimestamp(receivedAt.Sub(c.anchorLocal))
 		c.anchorLocal = receivedAt
 	}
 	c.timelineID = timelineID
+	c.signalReadyLocked()
 	c.mu.Unlock()
 
 	dbg("[PTP] event timing peer update: timeline=0x%016x (was 0x%016x)", timelineID, previousTimeline)
@@ -400,8 +460,71 @@ func (c *AirPlayClient) requestSetup(uri, phase string, request map[string]inter
 	return response, headers, receivedAt, nil
 }
 
-// setupMirrorSession negotiates the mirroring stream with the Apple TV.
+// teardownFailedMirrorSetup releases the receiver session that an accepted
+// SETUP created when the rest of setup failed. Without it the receiver keeps
+// the half-built session, and a retry on a new connection, such as the NTP
+// timing fallback, can find it still busy. If the TEARDOWN itself fails, the
+// control connection is closed, since the receiver's session state is then
+// uncertain.
+func (c *AirPlayClient) teardownFailedMirrorSetup(uri string, timeout time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn == nil {
+		return fmt.Errorf("control connection is nil")
+	}
+	deadline := time.Now().Add(timeout)
+	if err := c.conn.SetWriteDeadline(deadline); err != nil {
+		_ = c.conn.Close()
+		return fmt.Errorf("set TEARDOWN write deadline: %w", err)
+	}
+	defer c.conn.SetWriteDeadline(time.Time{})
+
+	send := func(extraHeaders map[string]string) (map[string]string, error) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, context.DeadlineExceeded
+		}
+		_, headers, err := c.rtspRequestOnceWithTimeout("TEARDOWN", uri, "", nil, extraHeaders, remaining)
+		return headers, err
+	}
+	var extraHeaders map[string]string
+	if authHeader, ok := c.preemptiveAuthHeader("TEARDOWN", uri); ok {
+		extraHeaders = withHeader(extraHeaders, "Authorization", authHeader)
+	}
+	headers, err := send(extraHeaders)
+	authHeader, retry, err := c.digestRetryHeader("TEARDOWN", uri, headers, err)
+	if retry {
+		_, err = send(withHeader(extraHeaders, "Authorization", authHeader))
+		c.logIfAuthRejected("TEARDOWN", uri, err)
+	}
+	if err != nil {
+		_ = c.conn.Close()
+	}
+	return err
+}
+
+// setupMirrorSession selects PTP from the receiver's advertised capabilities.
+// If the receiver then rejects that session timing or never supplies a clock,
+// release the partial session and retry once with NTP. The fallback is based on
+// the live protocol exchange rather than a receiver model or software version.
 func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig, prepareVideoCapture func(width, height int, codec VideoCodec) (VideoPreparationResult, error), captureMayReportMinimumLead bool) (*MirrorSession, error) {
+	timingOverride := ""
+	if c.ntpFallback {
+		timingOverride = timingProtocolNTP
+	}
+	session, err := c.setupMirrorSessionAttempt(ctx, cfg, prepareVideoCapture, captureMayReportMinimumLead, timingOverride)
+	if !errors.Is(err, errPTPClockUnavailable) || c.ntpFallback || ctx.Err() != nil {
+		return session, err
+	}
+	dbg("[SETUP] advertised PTP was unavailable during SETUP; retrying the session with NTP")
+	c.ntpFallback = true
+	if reconnectErr := c.reconnectMirrorControl(ctx); reconnectErr != nil {
+		return nil, fmt.Errorf("PTP timing unavailable (%v); reconnect for NTP: %w", err, reconnectErr)
+	}
+	return c.setupMirrorSessionAttempt(ctx, cfg, prepareVideoCapture, captureMayReportMinimumLead, timingProtocolNTP)
+}
+
+func (c *AirPlayClient) setupMirrorSessionAttempt(ctx context.Context, cfg StreamConfig, prepareVideoCapture func(width, height int, codec VideoCodec) (VideoPreparationResult, error), captureMayReportMinimumLead bool, timingOverride string) (*MirrorSession, error) {
 	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
 		return nil, err
 	}
@@ -418,6 +541,9 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	}
 	if err != nil {
 		return nil, fmt.Errorf("negotiate screen audio: %w", err)
+	}
+	if timingOverride != "" {
+		policy.timing = timingOverride
 	}
 	sourceVersion := policy.sourceVersion()
 	timingProtocol := policy.timing
@@ -477,9 +603,19 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	sessionCtx, cancelSession := context.WithCancel(ctx)
 	var receiverEventConn, dataConn net.Conn
 	setupSucceeded := false
+	acceptedSessionURI := ""
 	defer func() {
 		if setupSucceeded {
 			return
+		}
+		// Once SETUP has created receiver state, release it before closing the
+		// local media transports.
+		if acceptedSessionURI != "" {
+			if err := c.teardownFailedMirrorSetup(acceptedSessionURI, failedMirrorSetupTeardownTimeout); err != nil {
+				dbg("[TEARDOWN] failed setup cleanup for %s: %v", acceptedSessionURI, err)
+			} else {
+				dbg("[TEARDOWN] released failed setup for %s", acceptedSessionURI)
+			}
 		}
 		cancelSession()
 		if dataConn != nil {
@@ -580,7 +716,7 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 	recorded := false
 
 	firstSetup := true
-	sendSetup := func(uri, phase string, request map[string]interface{}) (map[string]interface{}, map[string]string, time.Time, error) {
+	sendSetupRequest := func(uri, phase string, request map[string]interface{}) (map[string]interface{}, map[string]string, time.Time, error) {
 		if !firstSetup {
 			return c.requestSetup(uri, phase, request)
 		}
@@ -600,6 +736,15 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		}()
 		defer close(setupHintDone)
 		return c.requestSetup(uri, phase, request)
+	}
+	// sendSetup remembers the first SETUP the receiver accepted: that request
+	// created the receiver session a failed setup has to release.
+	sendSetup := func(uri, phase string, request map[string]interface{}) (map[string]interface{}, map[string]string, time.Time, error) {
+		response, headers, receivedAt, err := sendSetupRequest(uri, phase, request)
+		if err == nil && acceptedSessionURI == "" {
+			acceptedSessionURI = uri
+		}
+		return response, headers, receivedAt, err
 	}
 
 	recordSession := func() error {
@@ -665,6 +810,21 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			return nil
 		}
 		if err := clock.configureFromSetup(response, headers, receivedAt); err != nil {
+			if errors.Is(err, errPTPClockUnavailable) {
+				async, _ := response["asyncPTPClockConfig"].(bool)
+				if async {
+					if receiverEventConn == nil {
+						return fmt.Errorf("configure PTP media clock: %w: receiver requested asynchronous clock configuration without an event channel", errPTPClockUnavailable)
+					}
+					dbg("[PTP] waiting for asynchronous timing peer information on the event channel")
+					if waitErr := clock.waitUntilReady(sessionCtx, asyncPTPClockWaitTimeout); waitErr != nil {
+						return fmt.Errorf("configure PTP media clock: %w", waitErr)
+					}
+					dbg("[PTP] asynchronous receiver clock: timeline=0x%016x", clock.identity())
+					return nil
+				}
+				return fmt.Errorf("configure PTP media clock: %w", err)
+			}
 			if policy.permitsLocalPTPClock() {
 				if fallbackErr := clock.configureFromLocalClock(); fallbackErr == nil {
 					dbg("[PTP] %v; using local boot time on receiver timeline 0x%016x", err, clock.identity())
@@ -771,6 +931,15 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		// display state. Refresh whenever the accepted combined response did not
 		// explicitly supply a usable display; a nonzero pre-session display can be
 		// provisional too.
+		startReceiverTimingProbes(controlResp)
+		skipRecord, _ = controlResp["skipRecord"].(bool)
+		observeEventPort(controlResp)
+		if err := connectEvent(); err != nil {
+			return nil, err
+		}
+		if err := configurePTPClock(controlResp, controlHeaders, receivedAt); err != nil {
+			return nil, err
+		}
 		if prepareVideoCapture != nil && !sessionDisplayResolved {
 			refreshed, refreshErr := refreshSessionInfo("post-control")
 			if refreshErr != nil {
@@ -779,15 +948,6 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 			resolvedInfo = refreshed
 		}
 		if err := prepareVideo(resolvedInfo); err != nil {
-			return nil, err
-		}
-		startReceiverTimingProbes(controlResp)
-		skipRecord, _ = controlResp["skipRecord"].(bool)
-		if err := configurePTPClock(controlResp, controlHeaders, receivedAt); err != nil {
-			return nil, err
-		}
-		observeEventPort(controlResp)
-		if err := connectEvent(); err != nil {
 			return nil, err
 		}
 		// Apple's real-time audio SETUP starts packet processing only after
@@ -885,6 +1045,9 @@ func (c *AirPlayClient) setupMirrorSession(ctx context.Context, cfg StreamConfig
 		}
 	}
 	if err != nil {
+		if timingProtocol == timingProtocolPTP && !sessionFirstSetup && setupShapeRejected(err) {
+			return nil, fmt.Errorf("%w: receiver rejected the PTP session descriptor (%v)", errPTPClockUnavailable, err)
+		}
 		return nil, err
 	}
 	audioSetupCommitted = true

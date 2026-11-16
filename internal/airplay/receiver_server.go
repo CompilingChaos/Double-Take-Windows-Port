@@ -68,10 +68,16 @@ type ReceiverConfig struct {
 	// optional nested info dictionary. It exercises the sender's post-session
 	// GET /info compatibility fallback.
 	OmitCombinedInfo bool
-	Name             string
-	Model            string
-	Manufacturer     string
-	DeviceID         string
+	// OmitPTPClockIdentity accepts a PTP session without returning
+	// timingPeerInfo.ClockID. AcceptNTPFallback additionally accepts an NTP
+	// session on a fresh, authenticated connection after TEARDOWN. These options
+	// exercise sender recovery from receivers with incomplete PTP negotiation.
+	OmitPTPClockIdentity bool
+	AcceptNTPFallback    bool
+	Name                 string
+	Model                string
+	Manufacturer         string
+	DeviceID             string
 	// DisplayWidth and DisplayHeight override the selected validation profile's
 	// advertised pixel size. They must be supplied together.
 	DisplayWidth  int
@@ -233,6 +239,9 @@ func NewReceiverServer(cfg ReceiverConfig) (*ReceiverServer, error) {
 	profile, err := receiverProfile(cfg.Profile)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.OmitPTPClockIdentity {
+		profile.providePTPClockIdentity = false
 	}
 	if (cfg.DisplayWidth == 0) != (cfg.DisplayHeight == 0) || cfg.DisplayWidth < 0 || cfg.DisplayHeight < 0 {
 		return nil, fmt.Errorf("receiver display dimensions must be two positive values or both zero")
@@ -569,6 +578,7 @@ type receiverConnection struct {
 	hap               *receiverHAPStream
 	media             *receiverMediaSession
 	timingProbed      bool
+	timingProtocol    string
 	legacyFairPlayKey [16]byte
 	legacyFairPlayIV  []byte
 	legacyFairPlaySet bool
@@ -1003,8 +1013,8 @@ func (c *receiverConnection) handleSetup(request receiverRequest) receiverRespon
 	if err := c.ensureMedia(); err != nil {
 		return receiverError(500, err)
 	}
-	if c.server.profile.timingProtocol == timingProtocolNTP &&
-		c.server.profile.ntpInitiator == receiverNTPReceiver && !c.timingProbed &&
+	if c.timingProtocol == timingProtocolNTP &&
+		(c.server.profile.ntpInitiator == receiverNTPReceiver || c.server.cfg.AcceptNTPFallback) && !c.timingProbed &&
 		plistInt(setup["timingPort"]) > 0 {
 		c.probeLegacyTiming(setup)
 	}
@@ -1020,7 +1030,8 @@ func (c *receiverConnection) handleSetup(request receiverRequest) receiverRespon
 			response["info"] = c.server.info(true)
 		}
 	}
-	if c.server.profile.timingProtocol == timingProtocolPTP && c.server.profile.providePTPClockIdentity {
+	setupTimingProtocol, _ := setup["timingProtocol"].(string)
+	if setupTimingProtocol == timingProtocolPTP && c.server.profile.providePTPClockIdentity {
 		response["timingPeerInfo"] = map[string]any{
 			"ClockID":                           int64(0x4454424c54414b45),
 			"ID":                                c.server.identifier,
@@ -1112,10 +1123,13 @@ func (c *receiverConnection) validateSetup(setup map[string]any, streams []map[s
 
 	if hasSession {
 		protocol, _ := setup["timingProtocol"].(string)
-		if protocol != profile.timingProtocol {
+		acceptFallback := c.server.cfg.AcceptNTPFallback &&
+			profile.timingProtocol == timingProtocolPTP && protocol == timingProtocolNTP
+		if protocol != profile.timingProtocol && !acceptFallback {
 			return fmt.Errorf("timingProtocol is %q, want %q", protocol, profile.timingProtocol)
 		}
-		switch profile.timingProtocol {
+		c.timingProtocol = protocol
+		switch protocol {
 		case timingProtocolNTP:
 			if plistInt(setup["timingPort"]) <= 0 {
 				return fmt.Errorf("NTP SETUP omitted timingPort")

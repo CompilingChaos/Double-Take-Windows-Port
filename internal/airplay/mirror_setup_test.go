@@ -239,6 +239,21 @@ func TestSetupMirrorDigestRetryReusesStartedVideoPreparation(t *testing.T) {
 					serverErr <- err
 					return
 				}
+				// The rejected stream SETUP leaves the accepted control session
+				// behind; the client releases it before retrying with the password.
+				teardown, err := readRTSPTestRequest(reader)
+				if err != nil {
+					serverErr <- fmt.Errorf("read failed-setup TEARDOWN: %w", err)
+					return
+				}
+				if teardown.method != "TEARDOWN" || teardown.uri != control.uri {
+					serverErr <- fmt.Errorf("failed-setup cleanup = %s %s, want TEARDOWN %s", teardown.method, teardown.uri, control.uri)
+					return
+				}
+				if err := writeRTSPTestResponse(conn, 200, nil, nil); err != nil {
+					serverErr <- err
+					return
+				}
 				continue
 			}
 			if !strings.HasPrefix(streamSetup.headers["authorization"], "Digest ") {
