@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"doubletake/internal/daemon"
+	"doubletake/internal/netdns"
 	"gioui.org/io/key"
 	"gioui.org/layout"
 	"gioui.org/op/paint"
@@ -29,6 +30,7 @@ type desktopBackend interface {
 	focusedEnter()
 	setMuted(string, bool) daemon.Response
 	setVolume(string, int) daemon.Response
+	setCloudflareDNS(bool) daemon.Response
 }
 
 type desktop struct {
@@ -43,12 +45,18 @@ type desktop struct {
 	deviceList, sessionList     layout.List
 	search, credential          widget.Editor
 	clearSearch, cancel, submit widget.Clickable
-	devices                     map[deviceKey]*widget.Clickable
-	sessions                    map[string]*streamControls
-	pending                     *daemon.StreamInfo
-	focusCredential             bool
-	toasts                      []toast
-	errors                      []*errorPopup
+	cloudflareDNS               widget.Clickable
+	// dnsPrompt is the DNS change waiting for the user to accept the
+	// experimental-feature warning: true to switch Cloudflare on. Nothing
+	// touches the DNS settings until they press Continue.
+	dnsPrompt              *bool
+	dnsCancel, dnsContinue widget.Clickable
+	devices                map[deviceKey]*widget.Clickable
+	sessions               map[string]*streamControls
+	pending                *daemon.StreamInfo
+	focusCredential        bool
+	toasts                 []toast
+	errors                 []*errorPopup
 	// lastErrorID and lastSystemMessage are the daemon error and startup
 	// problem already shown, so each one pops up once.
 	lastErrorID       uint64
@@ -242,8 +250,17 @@ func (d *desktop) update(gtx layout.Context) {
 		d.focusCredential = true
 	}
 	if d.pending != nil {
+		d.dnsPrompt = nil
 		d.updateCredential(gtx)
 		return
+	}
+	if d.dnsPrompt != nil {
+		d.updateDNSPrompt(gtx)
+		return
+	}
+	if d.cloudflareDNS.Clicked(gtx) && !d.busy[cloudflareDNSTarget] {
+		enable := d.state.CloudflareDNS != netdns.StateOn
+		d.dnsPrompt = &enable
 	}
 	if d.clearSearch.Clicked(gtx) {
 		d.search.SetText("")
@@ -333,6 +350,43 @@ func (d *desktop) updateStream(gtx layout.Context, s daemon.StreamInfo) {
 		})
 		controls.volumeEdited = false
 	}
+}
+
+// cloudflareDNSTarget keys the DNS switch in busy, so a second click waits
+// for the first change to finish.
+const cloudflareDNSTarget = "cloudflare-dns"
+
+// updateDNSPrompt handles the experimental-feature warning. Escape cancels.
+func (d *desktop) updateDNSPrompt(gtx layout.Context) {
+	enable := *d.dnsPrompt
+	for {
+		e, ok := gtx.Event(key.Filter{Name: key.NameEscape})
+		if !ok {
+			break
+		}
+		if k, ok := e.(key.Event); ok && k.State == key.Press {
+			d.dnsPrompt = nil
+			return
+		}
+	}
+	if d.dnsCancel.Clicked(gtx) {
+		d.dnsPrompt = nil
+		return
+	}
+	if d.dnsContinue.Clicked(gtx) {
+		d.dnsPrompt = nil
+		d.setCloudflareDNS(enable)
+	}
+}
+
+func (d *desktop) setCloudflareDNS(enable bool) {
+	message := d.tr("Cloudflare DNS is on.", "Cloudflare-DNS ist aktiv.")
+	if !enable {
+		message = d.tr("Cloudflare DNS is off. Previous DNS servers restored.", "Cloudflare-DNS ist aus. Vorherige DNS-Server wiederhergestellt.")
+	}
+	d.command(cloudflareDNSTarget, message, func() daemon.Response {
+		return d.backend.setCloudflareDNS(enable)
+	})
 }
 
 func receiverName(name string) string {

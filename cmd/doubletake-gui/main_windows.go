@@ -12,6 +12,9 @@ import (
 )
 
 func main() {
+	if handleInstall() {
+		return
+	}
 	go func() {
 		if err := run(); err != nil {
 			showFatalWindow(err)

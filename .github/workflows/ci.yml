@@ -69,7 +69,12 @@ jobs:
       - name: Build Windows desktop app
         if: runner.os == 'Windows'
         shell: bash
-        run: go build -ldflags='-s -w -H windowsgui' -o doubletake.exe ./cmd/doubletake-gui
+        run: |
+          version=0.0.0-dev
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version=${GITHUB_REF_NAME#v}
+          fi
+          go build -ldflags="-s -w -X main.version=$version -H windowsgui" -o doubletake.exe ./cmd/doubletake-gui
 
       - name: Build DoubleTake command line app
         if: runner.os == 'Windows'

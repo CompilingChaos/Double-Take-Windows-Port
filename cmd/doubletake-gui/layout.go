@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"doubletake/internal/daemon"
+	"doubletake/internal/netdns"
 	"gioui.org/f32"
 	"gioui.org/font"
 	"gioui.org/io/pointer"
@@ -35,7 +36,7 @@ func (d *desktop) layout(gtx layout.Context) {
 	}
 	drawImage(gtx, d.background, image.Rectangle{Max: size})
 	body := gtx
-	if d.pending != nil {
+	if d.pending != nil || d.dnsPrompt != nil {
 		body = gtx.Disabled()
 	}
 	w, h := int(float32(size.X)/gtx.Metric.PxPerDp), int(float32(size.Y)/gtx.Metric.PxPerDp)
@@ -48,6 +49,8 @@ func (d *desktop) layout(gtx layout.Context) {
 	d.mainPanel(body, sidebar, w, h, mainPadding)
 	if d.pending != nil {
 		d.pairingDialog(gtx, w, h, *d.pending)
+	} else if d.dnsPrompt != nil {
+		d.dnsWarningDialog(gtx, w, h, *d.dnsPrompt)
 	}
 	// Error pop-ups sit in the bottom-right corner; brief notices stack above.
 	d.toastStack(gtx, w, d.errorStack(gtx, w, h))
@@ -66,7 +69,34 @@ func (d *desktop) topbar(gtx layout.Context, w int) {
 			break
 		}
 	}
-	d.statusPill(gtx, dp(gtx, w-28), dp(gtx, 22), service, green, muted, rgba(0x0c192c, 158), line, false)
+	right := dp(gtx, w-28)
+	d.statusPill(gtx, right, dp(gtx, 22), service, green, muted, rgba(0x0c192c, 158), line, false)
+	pillWidth := d.width(gtx, 12, font.Normal, service) + dp(gtx, 41)
+	d.cloudflareDNSButton(gtx, right-pillWidth-dp(gtx, 12))
+}
+
+// cloudflareDNSButton draws the DNS switch ending at the right edge given in
+// pixels. It is hidden until the adapters have been read, and where the
+// setting cannot be changed.
+func (d *desktop) cloudflareDNSButton(gtx layout.Context, right int) {
+	state := d.state.CloudflareDNS
+	if state != netdns.StateOn && state != netdns.StateOff {
+		return
+	}
+	label := d.tr("Use Cloudflare DNS", "Cloudflare-DNS nutzen")
+	fill, border, fg := rgba(0x0c192c, 158), line, muted
+	if state == netdns.StateOn {
+		label = d.tr("Cloudflare DNS on", "Cloudflare-DNS aktiv")
+		fill, border, fg = rgba(0x123a33, 190), rgba(0x54dca2, 90), green
+	}
+	control := gtx
+	if d.busy[cloudflareDNSTarget] {
+		label = d.tr("Waiting for Windows…", "Warte auf Windows…")
+		control = gtx.Disabled()
+	}
+	width := d.width(gtx, 12, font.SemiBold, label) + dp(gtx, 49)
+	r := image.Rect(right-width, dp(gtx, 22), right, dp(gtx, 55))
+	d.button(control, r, &d.cloudflareDNS, 18, fill, color.NRGBA{}, border, fg, label, "lock", 12)
 }
 
 func (d *desktop) sidebar(gtx layout.Context, width, height, padding int) {
@@ -364,4 +394,40 @@ func (d *desktop) button(gtx layout.Context, r image.Rectangle, button *widget.C
 			return layout.Dimensions{Size: r.Size()}
 		})
 	})
+}
+
+// dnsWarningDialog asks the user to confirm a DNS change before anything is
+// run, and says plainly that the feature is experimental.
+func (d *desktop) dnsWarningDialog(gtx layout.Context, w, h int, enable bool) {
+	box(gtx, rect(gtx, 0, 0, w, h), 0, rgba(0x02060c, 179), color.NRGBA{})
+	width := min(470, w-44)
+	textWidth := width - 54
+	title := d.tr("Experimental feature", "Experimentelle Funktion")
+	warning := d.tr(
+		"Switching DNS is experimental and still being tested. It is not guaranteed to be secure, and it may stop websites from loading on some networks.",
+		"Das Umschalten des DNS ist experimentell und wird noch getestet. Es ist nicht garantiert sicher und kann in manchen Netzwerken das Laden von Websites verhindern.")
+	action := d.tr(
+		"DoubleTake will set this computer's network adapters to Cloudflare DNS (1.1.1.1) with encrypted DNS over HTTPS. Windows will ask for administrator permission. The change stays on after DoubleTake closes, until you turn it off here.",
+		"DoubleTake stellt die Netzwerkadapter dieses Computers auf Cloudflare-DNS (1.1.1.1) mit verschlüsseltem DNS über HTTPS um. Windows fragt nach Administratorrechten. Die Änderung bleibt nach dem Schließen von DoubleTake aktiv, bis du sie hier ausschaltest.")
+	confirm := d.tr("Turn on", "Einschalten")
+	if !enable {
+		action = d.tr(
+			"DoubleTake will restore the DNS servers this computer used before. Windows will ask for administrator permission.",
+			"DoubleTake stellt die DNS-Server wieder her, die dieser Computer vorher verwendet hat. Windows fragt nach Administratorrechten.")
+		confirm = d.tr("Turn off", "Ausschalten")
+	}
+	warningHeight := d.textHeight(gtx, textWidth, 13, font.Normal, "", warning, 0)
+	actionHeight := d.textHeight(gtx, textWidth, 13, font.Normal, "", action, 0)
+	height := 128 + warningHeight + 14 + actionHeight + 28 + 48 + 27
+	x, y := (w-width)/2, max(20, (h-height)/2)
+	gradient(gtx, rect(gtx, x, y, width, height), 24, rgb(0x1f1a12), rgb(0x0f0d09), rgba(0xf5b54a, 70))
+	box(gtx, rect(gtx, x+27, y+27, 45, 45), 14, rgba(0xf5b54a, 36), rgba(0xf5b54a, 60))
+	d.label(gtx, rect(gtx, x+27, y+27, 45, 45), layout.Center, 22, font.Bold, rgb(0xf5c46a), "!")
+	d.label(gtx, rect(gtx, x+27, y+90, textWidth, 30), layout.W, 22, font.Bold, ink, title)
+	top := y + 128
+	top += d.paragraph(gtx, x+27, top, textWidth, 13, font.SemiBold, "", rgb(0xf5c46a), warning, 0) + 14
+	top += d.paragraph(gtx, x+27, top, textWidth, 13, font.Normal, "", muted, action, 0) + 28
+	half := (width - 64) / 2
+	d.button(gtx, rect(gtx, x+27, top, half, 48), &d.dnsCancel, 14, rgba(0xffffff, 9), color.NRGBA{}, line, ink, d.tr("Cancel", "Abbrechen"), "", 13)
+	d.button(gtx, rect(gtx, x+37+half, top, width-64-half, 48), &d.dnsContinue, 14, rgb(0xb7791f), rgb(0xd99a2b), color.NRGBA{}, ink, confirm, "", 13)
 }

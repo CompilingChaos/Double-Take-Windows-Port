@@ -56,7 +56,21 @@ next to the DoubleTake executables. Install FFmpeg with WinGet:
 winget install --id Gyan.FFmpeg --exact
 ```
 
-Extract the Windows release files to the same folder and open `doubletake.exe`.
+Open `doubletake.exe`. It installs itself the first time:
+
+- It copies itself to `%LOCALAPPDATA%\Programs\DoubleTake`, together with
+  `doubletake-cli.exe`, `doubletake-ctl.exe` and `ffmpeg.exe` when they are
+  in the same folder.
+- It adds **DoubleTake** to the Start menu and the desktop, and an entry
+  under **Settings > Apps** to uninstall it.
+- It does not start with Windows and needs no administrator rights.
+
+Opening any `doubletake.exe` later starts the installed copy when it is the
+identical build. A different build installs over it. To run a build where it is
+without installing, start it with `--portable` or set `DOUBLETAKE_PORTABLE=1`.
+Uninstalling removes the installed files and shortcuts and keeps your saved
+pairings in `%APPDATA%\doubletake`.
+
 Run `.\doubletake-cli.exe` to use receiver discovery from PowerShell.
 
 To build from source, install Go 1.27 or newer and run `.\build.ps1` in
@@ -79,6 +93,26 @@ starts muted. Use the speaker button or volume slider to enable it.
 Click **Freeze** or **Unfreeze**, then press **Enter** to apply it. On Windows
 and Linux X11, Enter works while another app has focus. On Wayland, press
 Enter in the DoubleTake window. Press Escape in DoubleTake to cancel.
+
+## Cloudflare DNS (Windows, experimental)
+
+The **Use Cloudflare DNS** button in the top bar switches this computer's
+connected network adapters to Cloudflare's resolvers (`1.1.1.1`, `1.0.0.1` and
+their IPv6 addresses). On Windows 11 it also turns on DNS over HTTPS for them,
+with plaintext fallback off, so lookups are encrypted. This is experimental:
+DoubleTake shows a warning before every change, and Windows asks for
+administrator permission. The change stays on after DoubleTake closes. Press
+the button again to restore the previous DNS servers.
+
+It changes only this computer, not your router or other devices, and AirPlay
+mirroring works the same either way. On some networks, such as hotel or
+airport Wi-Fi with a sign-in page, encrypted DNS can stop pages from loading.
+Turn it off there.
+
+The administrator step runs fixed PowerShell scripts from the Windows system
+folder, without the user's profile or module paths. The previous settings are
+saved under `HKLM\SOFTWARE\DoubleTake\CloudflareDNS`, which only
+administrators can write, and are deleted when they are restored.
 
 ## Command-line options
 

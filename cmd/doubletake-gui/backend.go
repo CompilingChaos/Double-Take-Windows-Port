@@ -5,12 +5,19 @@ package main
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"doubletake/internal/airplay"
 	"doubletake/internal/daemon"
+	"doubletake/internal/netdns"
 )
+
+// dnsRefreshInterval is how often the Cloudflare DNS button rereads the
+// adapters, so a change made in Windows Settings or a new network shows up.
+const dnsRefreshInterval = time.Minute
 
 type freezeHook interface {
 	ArmedState() (string, bool)
@@ -27,6 +34,9 @@ type backend struct {
 	focusedFreeze freezeArm
 	mu            sync.RWMutex
 	err           string
+	dns           netdns.State
+	// dnsMu serializes reading and changing the DNS servers.
+	dnsMu sync.Mutex
 }
 
 type snapshot struct {
@@ -35,6 +45,7 @@ type snapshot struct {
 	FreezeArmedTarget string
 	FreezeArmedAction bool
 	SystemMessage     string
+	CloudflareDNS     netdns.State
 }
 
 func (b *backend) setError(err error) {
@@ -56,7 +67,68 @@ func (b *backend) state() snapshot {
 	status := b.daemon.Execute(daemon.Request{Cmd: "status"})
 	devices := b.daemon.Execute(daemon.Request{Cmd: "devices"})
 	target, frozen := b.freezeControl().ArmedState()
-	return snapshot{Status: status, Devices: devices.Devices, FreezeArmedTarget: target, FreezeArmedAction: frozen, SystemMessage: b.systemMessage()}
+	b.mu.RLock()
+	dns := b.dns
+	b.mu.RUnlock()
+	return snapshot{Status: status, Devices: devices.Devices, FreezeArmedTarget: target, FreezeArmedAction: frozen, SystemMessage: b.systemMessage(), CloudflareDNS: dns}
+}
+
+// refreshDNS rereads whether this computer resolves names through Cloudflare.
+func (b *backend) refreshDNS(ctx context.Context) {
+	b.dnsMu.Lock()
+	defer b.dnsMu.Unlock()
+	state, _ := netdns.Status(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+	b.mu.Lock()
+	b.dns = state
+	b.mu.Unlock()
+}
+
+// setCloudflareDNS switches the connected network adapters to Cloudflare's
+// resolvers, or back to their previous servers. Windows asks for approval.
+func (b *backend) setCloudflareDNS(enable bool) daemon.Response {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	err := func() error {
+		b.dnsMu.Lock()
+		defer b.dnsMu.Unlock()
+		if enable {
+			return netdns.Enable(ctx)
+		}
+		return netdns.Disable(ctx)
+	}()
+	b.refreshDNS(ctx)
+	if err != nil {
+		return daemon.Response{Error: dnsErrorMessage(err)}
+	}
+	return daemon.Response{OK: true}
+}
+
+func dnsErrorMessage(err error) string {
+	german := uiLocale() == "de"
+	switch {
+	case errors.Is(err, netdns.ErrDeclined):
+		if german {
+			return "DNS wurde nicht geändert, weil die Administratorfreigabe abgelehnt wurde."
+		}
+		return "DNS was not changed because administrator permission was declined."
+	case errors.Is(err, netdns.ErrNoAdapter):
+		if german {
+			return "DNS wurde nicht geändert, weil kein verbundener Netzwerkadapter gefunden wurde."
+		}
+		return "DNS was not changed because no connected network adapter was found."
+	case errors.Is(err, netdns.ErrNotApplied):
+		if german {
+			return "Windows hat die DNS-Änderung nicht übernommen. Prüfe die DNS-Einstellungen des Netzwerkadapters."
+		}
+		return "Windows did not apply the DNS change. Check the network adapter's DNS settings."
+	}
+	if german {
+		return "DNS konnte nicht geändert werden: " + err.Error()
+	}
+	return "Could not change DNS: " + err.Error()
 }
 
 func (b *backend) connect(target string, port int, deviceID string) daemon.Response {
@@ -153,6 +225,18 @@ func newBackend(socketPath string) (*backend, error) {
 func (b *backend) start() func() {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(dnsRefreshInterval)
+		defer ticker.Stop()
+		for {
+			b.refreshDNS(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
 	go func() {
 		defer close(done)
 		if err := b.daemon.Run(ctx); err != nil && ctx.Err() == nil {
